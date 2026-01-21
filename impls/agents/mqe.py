@@ -20,7 +20,7 @@ from utils.networks import (
 
 
 class MQEAgent(flax.struct.PyTreeNode):
-    """Metric Distillation via Waypoints (MQE) agent."""
+    """Multistep Quasimetric Estimation (MQE) agent."""
 
     rng: Any
     network: Any
@@ -247,12 +247,6 @@ class MQEAgent(flax.struct.PyTreeNode):
         else:
             action_dim = ex_actions.shape[-1]
 
-        # zeta_schedule = optax.exponential_decay(
-        #     init_value=config['zeta'],
-        #     transition_steps=train_steps,
-        #     decay_rate=0.999,
-        #     end_value=0.0,
-        # )
         config['gamma'] = config['discount']
 
         # Define encoders.
