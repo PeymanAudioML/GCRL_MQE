@@ -162,42 +162,13 @@ class MQEAgent(flax.struct.PyTreeNode):
     @jax.jit
     def actor_loss(self, batch, grad_params, rng=None):
         # Maximize log Q if actor_log_q is True (which is default).
-
-        if self.config['use_latent']:
-            if self.config['freeze_enc_for_actor_grad']:
-                # psi_s = self.network.select('psi')(batch['observations'])
-                psi_g = self.network.select('psi')(batch['actor_goals'])
-                if len(psi_g.shape) == 3:
-                    # psi_s = jnp.mean(psi_s, axis=0)
-                    psi_g = jnp.mean(psi_g, axis=0)
-                dist = self.network.select('actor')(batch['observations'], psi_g, params=grad_params)
-                dist_bc = dist
-            else:
-                # psi_s = self.network.select('psi')(batch['observations'], params=grad_params)
-                psi_g = self.network.select('psi')(batch['actor_goals'], params=grad_params)
-            
-                if len(psi_g.shape) == 3:
-                    # psi_s = jnp.mean(psi_s, axis=0)
-                    psi_g = jnp.mean(psi_g, axis=0)
-                # goals = jnp.concatenate([batch['actor_goals'], psi_g], axis=-1)
-                dist = self.network.select('actor')(jax.lax.stop_gradient(batch['observations']), jax.lax.stop_gradient(psi_g), params=grad_params)
-                dist_bc = self.network.select('actor')(batch['observations'], psi_g, params=grad_params)
-        else:
-            dist = self.network.select('actor')(batch['observations'], batch['actor_goals'], params=grad_params)
-            dist_bc = dist
+        dist = self.network.select('actor')(batch['observations'], batch['actor_goals'], params=grad_params)
         if self.config['const_std']:
             q_actions = jnp.clip(dist.mode(), -1, 1)
         else:
             q_actions = jnp.clip(dist.sample(seed=rng), -1, 1)
-
-        if self.config['encoder'] is not None:
-            phi, _ = self.network.select('phi')(batch['observations'], q_actions)
-            # psi_s = self.network.select('psi')(batch['observations'])
-            psi_g, _ = self.network.select('psi')(batch['actor_goals'])
-            # phi = self.get_phi(phi_, psi_s)
-        else:
-            phi = self.network.select('phi')(batch['observations'], q_actions)
-            psi_g = self.network.select('psi')(batch['actor_goals'])
+        phi = self.network.select('phi')(batch['observations'], q_actions)
+        psi_g = self.network.select('psi')(batch['actor_goals'])
         q1, q2 = -self.distance(phi, psi_g)
         q = jnp.minimum(q1, q2)
 
@@ -206,10 +177,7 @@ class MQEAgent(flax.struct.PyTreeNode):
             q_loss = -q.mean() / jax.lax.stop_gradient(jnp.abs(q).mean() + 1e-6)
         else:
             q_loss = -q.mean()
-        log_prob = dist_bc.log_prob(batch['actions'])
-        # log_prob_policy = dist.log_prob(batch['actions'])
-        # alignment = jnp.minimum(self.config['alignment'], self.config['alpha'])
-        # bc_loss = -(alignment * log_prob).mean() - (self.config['alpha'] - alignment) * log_prob_policy.mean()
+        log_prob = dist.log_prob(batch['actions'])
         bc_loss = -(self.config['alpha'] * log_prob).mean()
 
         actor_loss = q_loss + bc_loss
