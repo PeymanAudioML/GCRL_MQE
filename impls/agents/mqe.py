@@ -237,7 +237,6 @@ class MQEAgent(flax.struct.PyTreeNode):
         ex_observations,
         ex_actions,
         config,
-        train_steps
     ):
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
