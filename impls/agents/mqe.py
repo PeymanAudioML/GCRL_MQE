@@ -68,19 +68,11 @@ class MQEAgent(flax.struct.PyTreeNode):
         intermediate_value_goals = jnp.where(use_next_state_mask, batch['next_observations'], batch['intermediate_value_goals'])
 
         batch_size = batch['observations'].shape[0]
-        if self.config['encoder'] is not None:
-            phi, phi_ = self.network.select('phi')(batch['observations'], batch['actions'], params=grad_params)
-            psi_s, psi_s_ = self.network.select('psi')(batch['observations'], params=grad_params)
-            psi_next, _ = self.network.select('psi')(intermediate_value_goals, params=grad_params)
-            psi_g, _ = self.network.select('psi')(batch['value_goals'], params=grad_params)
-        else:
-            phi = self.network.select('phi')(batch['observations'], batch['actions'], params=grad_params)
-            psi_s = self.network.select('psi')(batch['observations'], params=grad_params)
-            phi_ = phi
-            psi_s_ = psi_s
-            psi_next = self.network.select('psi')(intermediate_value_goals, params=grad_params)
-            psi_g = self.network.select('psi')(batch['value_goals'], params=grad_params)
-
+        phi = self.network.select('phi')(batch['observations'], batch['actions'], params=grad_params)
+        psi_s = self.network.select('psi')(batch['observations'], params=grad_params)
+        psi_next = self.network.select('psi')(intermediate_value_goals, params=grad_params)
+        psi_g = self.network.select('psi')(batch['value_goals'], params=grad_params)
+       
         if len(psi_s.shape) == 2:  # Non-ensemble
             phi = phi[None, ...]
             psi_s = psi_s[None, ...]
@@ -94,14 +86,11 @@ class MQEAgent(flax.struct.PyTreeNode):
         dist_next = self.distance(psi_next[:, :, None], psi_g[:, None, :])
  
         I = jnp.eye(batch_size)
-        logits = -dist # / jnp.sqrt(phi.shape[-1])
+        logits = -dist 
 
 
         action_dist = self.distance(psi_s, phi)
-        # weight_reg = self.config['weight_decay'] * jnp.mean(jnp.square(phi))
         action_invariance_loss = jnp.mean(jnp.square(jnp.exp(-action_dist) - 1))
-        # print('dist.shape', dist.shape)
-        # print('dist_next.shape', dist_next.shape)
 
         def compute_backup(dist, dist_next):
             t = self.config['t']
@@ -109,10 +98,7 @@ class MQEAgent(flax.struct.PyTreeNode):
             delta = dist - dist_next
             mask = delta > t
             delta_clipped = jnp.where(mask, t, delta)
-            # use_next_state_mask.squeeze(1) should have shape (B,)
             one_step_mask = jnp.where(use_next_state_mask.reshape(use_next_state_mask.shape[0],), 1.0, batch['intermediate_value_goals_offsets'])[None,:,None]
-            # print(delta.shape)
-            # print(one_step_mask.shape)
 
             s = gamma ** one_step_mask
             divergence = jnp.where(mask, delta, s * jnp.exp(delta_clipped) - dist)
