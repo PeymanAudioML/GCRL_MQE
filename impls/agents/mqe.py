@@ -38,7 +38,6 @@ class MQEAgent(flax.struct.PyTreeNode):
             mask = jnp.arange(d) < d // 2
             max_component: jnp.ndarray = jax.nn.relu(jnp.max((x - y) * mask, axis=-1)) 
             l2_component: jnp.ndarray = jnp.linalg.norm((x - y) * (1 - mask) + eps, axis=-1)
-            # assert max_component.shape == l2_component.shape
             return max_component + l2_component
 
         x_split = jnp.stack(jnp.split(x, K, axis=-1), axis=-1)
@@ -121,7 +120,6 @@ class MQEAgent(flax.struct.PyTreeNode):
         logits_neg = jnp.sum(logits * (1 - I)) / jnp.sum(1 - I)
 
         return (
-            # (critic_loss, backup_loss),
             critic_loss,
             {
                 'critic_loss': critic_loss,
@@ -139,8 +137,6 @@ class MQEAgent(flax.struct.PyTreeNode):
                 'dist': dist.mean(),
                 'phi_mag': jnp.mean(jnp.abs(phi)),
                 'psi_s_mag': jnp.mean(jnp.abs(psi_s)),
-                # 'phi_relu_mag': jnp.mean(jax.nn.relu(phi_)),
-                # 'dist_': dist_.mean(),
                 'biggest_diff_in_dist': jnp.max(dist - dist_next),
             },
         )
