@@ -175,8 +175,8 @@ class MQEAgent(flax.struct.PyTreeNode):
             'std': jnp.mean(dist.scale_diag),
         }
 
-    @partial(jax.jit, static_argnames="critic_only")
-    def total_loss(self, batch, grad_params, rng=None, critic_only=False, step: int=0):
+    @jax.jit
+    def total_loss(self, batch, grad_params, rng=None):
         info = {}
         rng = rng if rng is not None else self.rng
         rng, critic_rng = jax.random.split(rng)
@@ -194,13 +194,13 @@ class MQEAgent(flax.struct.PyTreeNode):
 
         total_loss = critic_loss + actor_loss
         return total_loss, info
-
-    @partial(jax.jit, static_argnames="critic_only")
-    def update(self, batch, critic_only=False, step: int=0):
+    
+    @jax.jit
+    def update(self, batch):
         new_rng, rng = jax.random.split(self.rng)
 
         def loss_fn(grad_params):
-            return self.total_loss(batch, grad_params, rng=rng, critic_only=critic_only, step=step)
+            return self.total_loss(batch, grad_params, rng=rng)
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
 
