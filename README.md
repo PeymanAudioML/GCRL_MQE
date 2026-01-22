@@ -4,7 +4,12 @@
     <img src="assets/mainfig.svg"><br><br>
 </div>
 
-We use OGBench for our experiments, to reproduce the results, please use the following commands:
-
-```shell
-```
+This repository contains the implementation of Multistep Quasimetric Estimation (MQE) in OGBench. We also include the following baselines:
+* Goal-conditioned behavior cloning (GCBC)
+* Goal-conditioned implicit Value/Q-learning (GCIVL/GCIQL)
+* Hierarchical implicit Q-learning (HIQL)
+* Quasimetric reinforcement learning (QRL)
+* N-Step goal-conditioned soft actor-critic + behavior cloning (NGCSAC+BC)
+* Contrastive Reinforcement Learning (CRL)
+* Contrastive Metric Distillation (CMD)
+* Temporal Metric Distillation (TMD)
