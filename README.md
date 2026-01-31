@@ -1,6 +1,7 @@
 <div align="center">
     <h1> Multistep Quasimetric Learning for Scalable Goal-conditioned Reinforcement Learning </h1>
     <h2> Bill Zheng, Vivek Myers, Benjamin Eysenbach, Sergey Levine </h2>
+    <h2> ICLR 2026 </h2>
     <img src="assets/mainfig.svg"><br><br>
 </div>
 
