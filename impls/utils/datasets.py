@@ -202,7 +202,7 @@ class GCDataset:
                 stacked_observations = self.get_stacked_observations(np.arange(self.size))
                 self.dataset = Dataset(self.dataset.copy(dict(observations=stacked_observations)))
 
-    def sample(self, batch_size, idxs=None, evaluation=False):
+    def sample(self, batch_size: int, idxs=None, evaluation=False):
         """Sample a batch of transitions with goals.
 
         This method samples a batch of transitions with goals (value_goals and actor_goals) from the dataset. They are
@@ -221,14 +221,41 @@ class GCDataset:
         if self.config['frame_stack'] is not None:
             batch['observations'] = self.get_observations(idxs)
             batch['next_observations'] = self.get_observations(idxs + 1)
+        try:
+            lambda_ = self.config['lambda_']
+        except:
+            lambda_ = 0.0
+        # print(lambda_)
+        try: 
+            intermediate_value_geom_sample = self.config['intermediate_value_geom_sample']
+        except:
+            intermediate_value_geom_sample = True # defaults to true
 
-        value_goal_idxs = self.sample_goals(
+        value_goal_idxs_preprocessed, value_goal_offsets_preprocessed = self.sample_goals(
             idxs,
             self.config['value_p_curgoal'],
             self.config['value_p_trajgoal'],
             self.config['value_p_randomgoal'],
             self.config['value_geom_sample'],
+            discount=None,
+            return_offset=True,
         )
+
+        intermediate_value_goal_idxs_preprocessed, goal_idxs_offset = self.sample_goals(
+            idxs,
+            self.config['value_p_curgoal'],
+            self.config['value_p_trajgoal'],
+            self.config['value_p_randomgoal'],
+            intermediate_value_geom_sample,
+            discount=lambda_,
+            return_offset=True,
+        )
+
+        value_goal_idxs = value_goal_idxs_preprocessed
+        intermediate_value_goal_idxs = np.where(intermediate_value_goal_idxs_preprocessed < value_goal_idxs_preprocessed, intermediate_value_goal_idxs_preprocessed, value_goal_idxs_preprocessed)
+
+        goal_idxs_offset = np.where(value_goal_offsets_preprocessed < goal_idxs_offset, value_goal_offsets_preprocessed, goal_idxs_offset)
+        
         actor_goal_idxs = self.sample_goals(
             idxs,
             self.config['actor_p_curgoal'],
@@ -238,6 +265,9 @@ class GCDataset:
         )
 
         batch['value_goals'] = self.get_observations(value_goal_idxs)
+        batch['intermediate_value_goals'] = self.get_observations(intermediate_value_goal_idxs)
+        batch['intermediate_value_goals_offsets'] = goal_idxs_offset
+        batch['value_goals_offsets'] = value_goal_offsets_preprocessed
         batch['actor_goals'] = self.get_observations(actor_goal_idxs)
         successes = (idxs == value_goal_idxs).astype(float)
         batch['masks'] = 1.0 - successes
@@ -249,8 +279,11 @@ class GCDataset:
 
         return batch
 
-    def sample_goals(self, idxs, p_curgoal, p_trajgoal, p_randomgoal, geom_sample):
-        """Sample goals for the given indices."""
+    def sample_goals(self, idxs, p_curgoal, p_trajgoal, p_randomgoal, geom_sample, discount=None, return_offset=False, value_offsets=None):
+        if discount is None:
+            discount = self.config['discount']
+        # hack: we define batch["intermediate value goals"] to be sampled with self.config['discount'] - (1 - self.config['discount'])
+        # only p_trajgoal==1 is supported
         batch_size = len(idxs)
 
         # Random goals.
@@ -258,27 +291,43 @@ class GCDataset:
 
         # Goals from the same trajectory (excluding the current state, unless it is the final state).
         final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
-        if geom_sample:
-            # Geometric sampling.
-            offsets = np.random.geometric(p=1 - self.config['discount'], size=batch_size)  # in [1, inf)
-            traj_goal_idxs = np.minimum(idxs + offsets, final_state_idxs)
+        if return_offset:
+            if geom_sample:
+                if value_offsets is not None:
+                    offsets = np.random.binomial(n=value_offsets, p=0.2)
+                else:
+                    offsets = np.random.geometric(p=1 - discount, size=batch_size)  # in [1, inf)
+                middle_goal_idxs = np.minimum(idxs + offsets, final_state_idxs)
+                offsets = np.minimum(offsets, final_state_idxs - idxs)
+            else:
+                distances = np.random.rand(batch_size)  # in [0, 1)
+                middle_goal_idxs = np.round(
+                    (np.minimum(idxs + 1, final_state_idxs) * distances + final_state_idxs * (1 - distances))
+                    ).astype(int)
+
+                offsets = middle_goal_idxs - idxs
+        elif geom_sample:
+            offsets = np.random.geometric(p=1 - discount, size=batch_size)  # in [1, inf)
+            middle_goal_idxs = np.minimum(idxs + offsets, final_state_idxs)
         else:
-            # Uniform sampling.
             distances = np.random.rand(batch_size)  # in [0, 1)
-            traj_goal_idxs = np.round(
+            middle_goal_idxs = np.round(
                 (np.minimum(idxs + 1, final_state_idxs) * distances + final_state_idxs * (1 - distances))
             ).astype(int)
-        if p_curgoal == 1.0:
-            goal_idxs = idxs
+
+        goal_idxs = np.where(
+            np.random.rand(batch_size) < p_trajgoal / (1.0 - p_curgoal + 1e-6), middle_goal_idxs, random_goal_idxs
+        )
+
+        # Goals at the current state.
+        cur_goal_mask = np.random.rand(batch_size) < p_curgoal
+        goal_idxs = np.where(cur_goal_mask, idxs, goal_idxs)
+
+        if return_offset:
+            offsets = np.where(cur_goal_mask, 0, offsets)
+            return goal_idxs, offsets
         else:
-            goal_idxs = np.where(
-                np.random.rand(batch_size) < p_trajgoal / (1.0 - p_curgoal), traj_goal_idxs, random_goal_idxs
-            )
-
-            # Goals at the current state.
-            goal_idxs = np.where(np.random.rand(batch_size) < p_curgoal, idxs, goal_idxs)
-
-        return goal_idxs
+            return goal_idxs
 
     def augment(self, batch, keys):
         """Apply image augmentation to the given keys."""
