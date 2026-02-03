@@ -287,7 +287,6 @@ class MQEAgent(flax.struct.PyTreeNode):
                 layer_norm=config['layer_norm'],
                 ensemble=True,
                 value_exp=True,
-                # dropout=config['dropout'],
                 state_encoder=encoders.get('state'),
             )
             psi_def = StateRepresentation(
@@ -296,7 +295,6 @@ class MQEAgent(flax.struct.PyTreeNode):
                 layer_norm=config['layer_norm'],
                 ensemble=True,
                 value_exp=True,
-                # dropout=config['dropout'],
                 state_encoder=encoders.get('state'),
             )
             actor_def = GCActor(
@@ -315,10 +313,9 @@ class MQEAgent(flax.struct.PyTreeNode):
         network_args = {k: v[1] for k, v in network_info.items()}
 
         network_def = ModuleDict(networks)
-        network_tx = optax.adam(learning_rate=config['lr'])# , weight_decay=config['weight_decay'])
+        network_tx = optax.adam(learning_rate=config['lr'])
         network_params = network_def.init(init_rng, **network_args)['params']
         network = TrainState.create(network_def, network_params, tx=network_tx)
-        # zeta_optimizer = DualOptimizer()
         return cls(rng, network=network, config=flax.core.FrozenDict(**config))
 
 
@@ -336,7 +333,6 @@ def get_config():
             value_hidden_dims=(512, 512, 512),  # Value network hidden dimensions.
             latent_dim=512,  # Latent dimension for phi and psi.
             layer_norm=True,  # Whether to use layer normalization.
-            dropout=0.1, # dropout for just the value network
             discount=0.995,  # Discount factor.
             lambda_=0.95, # lambda for n-step backup
             alpha=0.1,  # Temperature in AWR or BC coefficient in DDPG+BC.
@@ -359,16 +355,11 @@ def get_config():
             actor_geom_sample=False,  # Whether to use geometric sampling for future actor goals.
             gc_negative=False,  # Unused (defined for compatibility with GCDataset).
             p_aug=0.0,  # Probability of applying image augmentation.
-            freeze_enc_for_actor_grad=False,  # Whether to stop grad for actor when using encoder
-            action_invariance_arch=True,
             frame_stack=ml_collections.config_dict.placeholder(int),  # Number of frames to stack.
             use_action_for_distance=True,  # Whether to use action for distance computation
-            log_invariance=False,  # Whether to log invariance loss
             normalize_q_loss=True,  # Whether to normalize Q loss
             next_state_sample=0.2, # probability of using next state as value goal
             cotrain_steps=500_000, # number of steps to cotrain
-            alignment=1e-3,  # weight for alignment loss
-            simplify_dist=True,  # Whether to simplify distance computation
         )
     )
     return config
