@@ -111,8 +111,6 @@ class MQEAgent(flax.struct.PyTreeNode):
         backup_loss, optim_backup = compute_backup(dist, jax.lax.stop_gradient(dist_next)) # optim_backup=0 -> recovers behavior distance
         optim_backup = jnp.mean(optim_backup)
 
-        zeta, backup_weight = 1.0, 1.0
-        invariance_weight = self.config['zeta']
         critic_loss = backup_loss + action_invariance_loss
         logits = jnp.mean(logits, axis=0)
         correct = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)
@@ -126,15 +124,13 @@ class MQEAgent(flax.struct.PyTreeNode):
                 'backup_loss': backup_loss,
                 'backup_optim_loss': backup_loss - optim_backup,
                 'action_invariance_loss': action_invariance_loss,
-                'zeta': zeta,
-                'invariance_weight': invariance_weight,
-                'backup_weight': backup_weight,
                 'binary_accuracy': jnp.mean((logits > 0) == I),
                 'categorical_accuracy': jnp.mean(correct),
                 'logits_pos': logits_pos,
                 'logits_neg': logits_neg,
                 'logits': logits.mean(),
                 'dist': dist.mean(),
+                # debug metrics
                 'phi_mag': jnp.mean(jnp.abs(phi)),
                 'psi_s_mag': jnp.mean(jnp.abs(psi_s)),
                 'biggest_diff_in_dist': jnp.max(dist - dist_next),
