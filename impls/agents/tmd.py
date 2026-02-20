@@ -172,10 +172,6 @@ class TMDAgent(flax.struct.PyTreeNode):
         else:
             q_actions = jnp.clip(dist.sample(seed=rng), -1, 1)
 
-        actions_roll = jnp.roll(batch['actions'], shift=1, axis=0)
-
-        assert q_actions.shape == actions_roll.shape
-
         phi = self.network.select('phi')(batch['observations'], q_actions)
         psi = self.network.select('psi')(batch['actor_goals'])
         q1, q2 = -self.distance(phi, psi)
