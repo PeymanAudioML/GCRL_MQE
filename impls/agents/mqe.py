@@ -321,29 +321,28 @@ def get_config():
             # Agent hyperparameters.
             # Network hyperparameters.
             agent_name='mqe',  # Agent name.
-            lr=3e-4,
-            weight_decay=1e-4, # weight decay for adamw
+            lr=3e-4, # Learning rate.
             components=8,  # Number of components to average in the MRN/IQE distance ensemble.
             batch_size=256,  # Batch size.
             critic_batch_size=256,  # Batch size for critic.
             actor_hidden_dims=(512, 512, 512),  # Actor network hidden dimensions.
             value_hidden_dims=(512, 512, 512),  # Value network hidden dimensions.
-            latent_dim=512,  # Latent dimension for phi and psi.
-            layer_norm=True,  # Whether to use layer normalization.
+            latent_dim=512,  # Latent dimension for actors/encoders.
+            layer_norm=True,  # Whether to use layer normalization for networks.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
             actor_log_q=True,  # Whether to maximize log Q (True) or Q itself (False) in the actor loss.
             const_std=True,  # Whether to use constant standard deviation for the actor.
             discrete=False,  # Whether the action space is discrete.
-            normalize_q_loss=True,  # Whether to normalize Q loss
+            normalize_q_loss=True,  # Whether to normalize Q loss.
 
 
 
             # MQE hyperparameters
-            discount=0.995,  # Discount factor.
-            lambda_=0.95, # lambda for n-step backup
-            next_state_sample=0.2, # probability of using next state as value goal
+            discount=0.995,  # Discount factor for sampling value_goal via geometric dist.
+            lambda_=0.95, # lambda for sampling intermediate_value_goal via geometric dist.
+            next_state_sample=0.2, # probability of using next state as intermediate_value_goal.
             alpha=0.1,  # Temperature in AWR or BC coefficient in DDPG+BC.
-            t=5.0,  # Clipping threshold for the backup LINEX loss.
+            t=5.0,  # Clipping threshold for the backup LINEX loss. You can increase this if you want more accurate regression (although this might cause numerical instability).
             diag_backup=0.5,  # Weighting of backups on diagonal (i.e., for s,g ~ p(s,g)) vs. off-diagonal (i.e., for s,g ~ p(s)p(g)). We recommend this to be 0.2-0.4 for locomotion tasks, 0.5-1 for manipulation tasks.
 
             
@@ -351,16 +350,16 @@ def get_config():
             # Dataset hyperparameters.
             dataset_class='GCDataset',  # Dataset class name.
             value_p_curgoal=0.0,  # Probability of using the current state as the value goal.
-            value_p_trajgoal=1.0,  # Probability of using a future state in the same trajectory as the value goal.
+            value_p_trajgoal=1.0,  # Probability of using a future state in the same trajectory as the value goal. Note that we don't need to sample random states as goals because the off-diagonals for distance calculation can suffice for sampling random goals.
             value_p_randomgoal=0.0,  # Probability of using a random state as the value goal.
-            value_geom_sample=True,  # Whether to use geometric sampling for future value goals.
-            intermediate_value_geom_sample=True,  # Whether to use geometric sampling for intermediate value goals, otherwise defaults to uniform sampling.
+            value_geom_sample=True,  # Whether to use geometric distribution for sampling for future value goals.
+            intermediate_value_geom_sample=True,  # Whether to use geometric sampling for intermediate value goals, otherwise defaults to uniform sampling between current state and value_goals.
             actor_p_curgoal=0.0,  # Probability of using the current state as the actor goal.
             actor_p_trajgoal=1.0,  # Probability of using a future state in the same trajectory as the actor goal.
             actor_p_randomgoal=0.0,  # Probability of using a random state as the actor goal.
             actor_geom_sample=False,  # Whether to use geometric sampling for future actor goals.
             gc_negative=False,  # Unused for this method (defined for compatibility with GCDataset).
-            p_aug=0.0,  # Probability of applying image augmentation.
+            p_aug=0.0,  # Probability of applying image augmentation. Unused for state-based methods.
             frame_stack=ml_collections.config_dict.placeholder(int),  # Number of frames to stack.
 
 
