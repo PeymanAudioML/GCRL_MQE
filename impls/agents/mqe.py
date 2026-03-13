@@ -53,14 +53,7 @@ class MQEAgent(flax.struct.PyTreeNode):
 
     @jax.jit
     def critic_loss(self, batch, grad_params, critic_rng):
-        if self.config["batch_size"] == self.config["critic_batch_size"]:
-            batch = batch
-            batch_size = self.config['batch_size']
-        else:
-            key = jax.random.PRNGKey(critic_rng[0])
-            batch_size = self.config['critic_batch_size']
-            idx2 = jax.random.permutation(key, self.config['batch_size'])[:self.config['critic_batch_size']]
-            batch = jax.tree.map(lambda x: x[idx2], batch)
+        batch_size = self.config['batch_size']
         key = jax.random.PRNGKey(critic_rng[1])
         use_next_state = jax.random.bernoulli(key, p=self.config['next_state_sample'], shape=(batch_size,))
         use_next_state_mask = jnp.reshape(use_next_state, (batch_size, *[1] * (len(batch['observations'].shape) - 1)))
@@ -324,7 +317,6 @@ def get_config():
             lr=3e-4, # Learning rate.
             components=8,  # Number of components to average in the MRN/IQE distance ensemble.
             batch_size=256,  # Batch size.
-            critic_batch_size=256,  # Batch size for critic.
             actor_hidden_dims=(512, 512, 512),  # Actor network hidden dimensions.
             value_hidden_dims=(512, 512, 512),  # Value network hidden dimensions.
             latent_dim=512,  # Latent dimension for actors/encoders.
