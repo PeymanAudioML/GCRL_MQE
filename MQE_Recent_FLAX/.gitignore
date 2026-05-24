@@ -1,0 +1,7 @@
+exp/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+wandb/
+*.egg-info/
