@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import ml_collections
 import optax
-
+from flax import nnx
 from utils.flax_utils import ModuleDict, TrainState
 from utils.networks import GCActor, GCValue, LogParam
 
@@ -31,7 +31,9 @@ class NGCSACBCAgent:
     def critic_loss(self, batch, grad_params, rng):
         """Compute the n-step SAC critic loss."""
         rng, sample_rng = jax.random.split(rng)
-        next_dist = self.network.select('actor')(batch['high_value_next_observations'], goals=batch['high_value_goals'])
+        next_dist = self.network.select('actor')(
+            batch['high_value_next_observations'], goals=batch['high_value_goals']
+        )
         next_actions, next_log_probs = next_dist.sample_and_log_prob(seed=sample_rng)
 
         next_qs = self.network.select('target_critic')(
@@ -56,7 +58,10 @@ class NGCSACBCAgent:
 
         if self.config['value_loss_type'] == 'squared':
             q = self.network.select('critic')(
-                batch['observations'], goals=batch['high_value_goals'], actions=batch['actions'], params=grad_params
+                batch['observations'],
+                goals=batch['high_value_goals'],
+                actions=batch['actions'],
+                params=grad_params,
             )
             critic_loss = jnp.square(q - target_q).mean()
 
@@ -68,7 +73,10 @@ class NGCSACBCAgent:
             }
         elif self.config['value_loss_type'] == 'bce':
             q_logit = self.network.select('critic')(
-                batch['observations'], goals=batch['high_value_goals'], actions=batch['actions'], params=grad_params
+                batch['observations'],
+                goals=batch['high_value_goals'],
+                actions=batch['actions'],
+                params=grad_params,
             )
             q = jax.nn.sigmoid(q_logit)
             log_q = jax.nn.log_sigmoid(q_logit)
@@ -88,10 +96,14 @@ class NGCSACBCAgent:
     def actor_loss(self, batch, grad_params, rng):
         """Compute the SAC actor loss."""
         # Actor loss.
-        dist = self.network.select('actor')(batch['observations'], goals=batch['high_actor_goals'], params=grad_params)
+        dist = self.network.select('actor')(
+            batch['observations'], goals=batch['high_actor_goals'], params=grad_params
+        )
         actions, log_probs = dist.sample_and_log_prob(seed=rng)
 
-        qs = self.network.select('critic')(batch['observations'], goals=batch['high_actor_goals'], actions=actions)
+        qs = self.network.select('critic')(
+            batch['observations'], goals=batch['high_actor_goals'], actions=actions
+        )
         q = jnp.mean(qs, axis=0)
 
         actor_loss = (log_probs * self.network.select('lam')() - q).mean()
@@ -200,51 +212,64 @@ class NGCSACBCAgent:
         """
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
+        rngs = nnx.Rngs(init_rng)
 
-        ex_observations = ex_observations
-        ex_actions = ex_actions
         ex_goals = ex_observations
         action_dim = ex_actions.shape[-1]
+        obs_dim = ex_observations.shape[-1]
+        goal_dim = ex_goals.shape[-1]
 
         if config['target_entropy'] is None:
             config['target_entropy'] = -config['target_entropy_multiplier'] * action_dim
 
+        # GCValue critic: called with (obs, goals=goal, actions=action).
+        critic_in = obs_dim + goal_dim + action_dim
+
         # Define networks.
+        # ensemble=True when num_qs > 1, else ensemble=False (single MLP).
+        use_ensemble = config['num_qs'] > 1
         critic_def = GCValue(
+            in_features=critic_in,
             hidden_dims=config['value_hidden_dims'],
             layer_norm=config['layer_norm'],
-            ensemble=config['num_qs'] > 1,
+            ensemble=use_ensemble,
+            rngs=rngs,
+        )
+        target_critic_def = GCValue(
+            in_features=critic_in,
+            hidden_dims=config['value_hidden_dims'],
+            layer_norm=config['layer_norm'],
+            ensemble=use_ensemble,
+            rngs=rngs,
         )
 
+        # GCActor: called with (obs, goals=goal).
+        actor_in = obs_dim + goal_dim
         actor_def = GCActor(
+            in_features=actor_in,
             hidden_dims=config['actor_hidden_dims'],
             action_dim=action_dim,
-            # layer_norm=config['layer_norm'],
             tanh_squash=config['tanh_squash'],
             state_dependent_std=config['state_dependent_std'],
             const_std=False,
             final_fc_init_scale=config['actor_fc_scale'],
+            rngs=rngs,
         )
 
         # Define the dual lam variable.
-        lam_def = LogParam()
+        lam_def = LogParam(rngs=rngs)
 
-        network_info = dict(
-            critic=(critic_def, (ex_observations, ex_goals, ex_actions)),
-            target_critic=(copy.deepcopy(critic_def), (ex_observations, ex_goals, ex_actions)),
-            actor=(actor_def, (ex_observations, ex_goals)),
-            lam=(lam_def, ()),
-        )
-        networks = {k: v[0] for k, v in network_info.items()}
-        network_args = {k: v[1] for k, v in network_info.items()}
-
-        network_def = ModuleDict(networks)
+        network_def = ModuleDict({
+            'critic': critic_def,
+            'target_critic': target_critic_def,
+            'actor': actor_def,
+            'lam': lam_def,
+        })
         network_tx = optax.adam(learning_rate=config['lr'])
-        network_params = network_def.init(init_rng, **network_args)['params']
-        network = TrainState.create(network_def, network_params, tx=network_tx)
+        network = TrainState.create(network_def, tx=network_tx)
 
-        params = network.params
-        params['modules_target_critic'] = params['modules_critic']
+        # Initialize target critic with same params as critic.
+        network.params['modules_target_critic'] = network.params['modules_critic']
 
         return cls(rng=rng, network=network, config=dict(config))
 

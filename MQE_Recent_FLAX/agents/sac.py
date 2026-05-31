@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import ml_collections
 import optax
+from flax import nnx
 from utils.flax_utils import ModuleDict, TrainState
 from utils.networks import GCActor, GCValue, LogParam
 
@@ -159,20 +160,36 @@ class SACAgent:
         """
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
+        rngs = nnx.Rngs(init_rng)
 
         action_dim = ex_actions.shape[-1]
+        obs_dim = ex_observations.shape[-1]
 
         if config['target_entropy'] is None:
             config['target_entropy'] = -config['target_entropy_multiplier'] * action_dim
 
+        # GCValue is called with (observations, None, actions) so in_features = obs_dim + action_dim.
+        critic_in = obs_dim + action_dim
+
         # Define critic and actor networks.
         critic_def = GCValue(
+            in_features=critic_in,
             hidden_dims=config['value_hidden_dims'],
             layer_norm=config['layer_norm'],
             ensemble=True,
+            rngs=rngs,
+        )
+        target_critic_def = GCValue(
+            in_features=critic_in,
+            hidden_dims=config['value_hidden_dims'],
+            layer_norm=config['layer_norm'],
+            ensemble=True,
+            rngs=rngs,
         )
 
+        # GCActor is called with (observations, None) so in_features = obs_dim.
         actor_def = GCActor(
+            in_features=obs_dim,
             hidden_dims=config['actor_hidden_dims'],
             action_dim=action_dim,
             log_std_min=-5,
@@ -180,27 +197,23 @@ class SACAgent:
             state_dependent_std=config['state_dependent_std'],
             const_std=False,
             final_fc_init_scale=config['actor_fc_scale'],
+            rngs=rngs,
         )
 
         # Define the dual alpha variable.
-        alpha_def = LogParam()
+        alpha_def = LogParam(rngs=rngs)
 
-        network_info = dict(
-            critic=(critic_def, (ex_observations, None, ex_actions)),
-            target_critic=(copy.deepcopy(critic_def), (ex_observations, None, ex_actions)),
-            actor=(actor_def, (ex_observations, None)),
-            alpha=(alpha_def, ()),
-        )
-        networks = {k: v[0] for k, v in network_info.items()}
-        network_args = {k: v[1] for k, v in network_info.items()}
-
-        network_def = ModuleDict(networks)
+        network_def = ModuleDict({
+            'critic': critic_def,
+            'target_critic': target_critic_def,
+            'actor': actor_def,
+            'alpha': alpha_def,
+        })
         network_tx = optax.adam(learning_rate=config['lr'])
-        network_params = network_def.init(init_rng, **network_args)['params']
-        network = TrainState.create(network_def, network_params, tx=network_tx)
+        network = TrainState.create(network_def, tx=network_tx)
 
-        params = network.params
-        params['modules_target_critic'] = params['modules_critic']
+        # Initialize target critic with same params as critic.
+        network.params['modules_target_critic'] = network.params['modules_critic']
 
         return cls(rng=rng, network=network, config=dict(config))
 

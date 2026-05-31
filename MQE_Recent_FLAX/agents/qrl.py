@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import ml_collections
 import numpy as np
 import optax
+from flax import nnx
 from utils.encoders import GCEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState
 from utils.networks import MLP, GCActor, GCDiscreteActor, GCIQEValue, GCMRNValue, LogParam
@@ -222,81 +223,100 @@ class QRLAgent:
         """
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
+        rngs = nnx.Rngs(init_rng)
 
         ex_goals = ex_observations
-        ex_latents = np.zeros((ex_observations.shape[0], config['latent_dim']), dtype=np.float32)
         if config['discrete']:
             action_dim = ex_actions.max() + 1
         else:
             action_dim = ex_actions.shape[-1]
 
+        obs_dim = ex_observations.shape[-1]
+        latent_dim = config['latent_dim']
+
         # Define encoders.
         encoders = dict()
         if config['encoder'] is not None:
-            encoder_module = encoder_modules[config['encoder']]
-            encoders['value'] = encoder_module()
-            encoders['actor'] = GCEncoder(concat_encoder=encoder_module())
+            obs_shape = ex_observations.shape[1:]
+            encoder_factory = encoder_modules[config['encoder']]
+            encoders['value'] = encoder_factory(obs_shape, rngs)
+            encoders['actor'] = GCEncoder(concat_encoder=encoder_factory(obs_shape, rngs))
+
+        # Compute value input dim (after optional encoder).
+        if encoders.get('value') is not None:
+            value_in = encoders['value'](ex_observations[:1]).shape[-1]
+        else:
+            value_in = obs_dim
 
         # Define value and actor networks.
         if config['quasimetric_type'] == 'mrn':
             value_def = GCMRNValue(
+                in_features=value_in,
                 hidden_dims=config['value_hidden_dims'],
-                latent_dim=config['latent_dim'],
+                latent_dim=latent_dim,
                 layer_norm=config['layer_norm'],
                 encoder=encoders.get('value'),
+                rngs=rngs,
             )
         elif config['quasimetric_type'] == 'iqe':
             value_def = GCIQEValue(
+                in_features=value_in,
                 hidden_dims=config['value_hidden_dims'],
-                latent_dim=config['latent_dim'],
+                latent_dim=latent_dim,
                 dim_per_component=8,
                 layer_norm=config['layer_norm'],
                 encoder=encoders.get('value'),
+                rngs=rngs,
             )
         else:
             raise ValueError(f'Unsupported quasimetric type: {config["quasimetric_type"]}')
 
+        modules = {'value': value_def}
+
         if config['actor_loss'] == 'ddpgbc':
             # DDPG+BC requires a latent dynamics model.
+            # Dynamics MLP: called with concat([ob_rep, action]) so in_features = latent_dim + action_dim.
             dynamics_def = MLP(
-                hidden_dims=(*config['value_hidden_dims'], config['latent_dim']),
+                in_features=latent_dim + action_dim,
+                hidden_dims=(*config['value_hidden_dims'], latent_dim),
                 layer_norm=config['layer_norm'],
+                rngs=rngs,
             )
+            modules['dynamics'] = dynamics_def
+
+        if encoders.get('actor') is not None:
+            actor_in = encoders['actor'](ex_observations[:1], ex_goals[:1]).shape[-1]
+        else:
+            actor_in = obs_dim + obs_dim
 
         if config['discrete']:
             actor_def = GCDiscreteActor(
+                in_features=actor_in,
                 hidden_dims=config['actor_hidden_dims'],
                 action_dim=action_dim,
                 gc_encoder=encoders.get('actor'),
+                rngs=rngs,
             )
         else:
             actor_def = GCActor(
+                in_features=actor_in,
                 hidden_dims=config['actor_hidden_dims'],
                 action_dim=action_dim,
                 state_dependent_std=False,
                 const_std=config['const_std'],
                 gc_encoder=encoders.get('actor'),
+                rngs=rngs,
             )
 
         # Define the dual lambda variable.
-        lam_def = LogParam()
+        lam_def = LogParam(rngs=rngs)
 
-        network_info = dict(
-            value=(value_def, (ex_observations, ex_goals)),
-            actor=(actor_def, (ex_observations, ex_goals)),
-            lam=(lam_def, ()),
-        )
-        if config['actor_loss'] == 'ddpgbc':
-            network_info.update(
-                dynamics=(dynamics_def, np.concatenate([ex_latents, ex_actions], axis=-1)),
-            )
-        networks = {k: v[0] for k, v in network_info.items()}
-        network_args = {k: v[1] for k, v in network_info.items()}
+        modules['actor'] = actor_def
+        modules['lam'] = lam_def
 
-        network_def = ModuleDict(networks)
+        network_def = ModuleDict(modules)
         network_tx = optax.adam(learning_rate=config['lr'])
-        network_params = network_def.init(init_rng, **network_args)['params']
-        network = TrainState.create(network_def, network_params, tx=network_tx)
+        network = TrainState.create(network_def, tx=network_tx)
 
         return cls(rng=rng, network=network, config=dict(config))
 

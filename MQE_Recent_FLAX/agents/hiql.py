@@ -1,16 +1,15 @@
-import copy
 import dataclasses
 import functools
 from typing import Any
 
-import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import ml_collections
 import optax
+from flax import nnx
 from utils.encoders import GCEncoder, encoder_modules
-from utils.flax_utils import ModuleDict, TrainState
-from utils.networks import MLP, GCActor, GCDiscreteActor, GCValue, Identity, LengthNormalize
+from utils.flax_utils import ModuleDict, Sequential, TrainState
+from utils.networks import GCActor, GCDiscreteActor, GCValue, Identity, LengthNormalize, MLP
 
 
 @functools.partial(
@@ -220,6 +219,7 @@ class HIQLAgent:
         """
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
+        rngs = nnx.Rngs(init_rng)
 
         ex_goals = ex_observations
         if config['discrete']:
@@ -227,102 +227,170 @@ class HIQLAgent:
         else:
             action_dim = ex_actions.shape[-1]
 
-        # Define (state-dependent) subgoal representation phi([s; g]) that outputs a length-normalized vector.
-        if config['encoder'] is not None:
-            encoder_module = encoder_modules[config['encoder']]
-            goal_rep_seq = [encoder_module()]
-        else:
-            goal_rep_seq = []
-        goal_rep_seq.append(
-            MLP(
-                hidden_dims=(*config['value_hidden_dims'], config['rep_dim']),
-                activate_final=False,
-                layer_norm=config['layer_norm'],
-            )
-        )
-        goal_rep_seq.append(LengthNormalize())
-        goal_rep_def = nn.Sequential(goal_rep_seq)
+        obs_dim = ex_observations.shape[-1]
+        goal_rep_in_dim = obs_dim + obs_dim  # [obs; goal] concatenated
 
-        # Define the encoders that handle the inputs to the value and actor networks.
-        # The subgoal representation phi([s; g]) is trained by the parameterized value function V(s, phi([s; g])).
-        # The high-level actor predicts the subgoal representation phi([s; w]) for subgoal w given s and g.
-        # The low-level actor predicts actions given the current state s and the subgoal representation phi([s; w]).
+        # Define (state-dependent) subgoal representation phi([s; g]) that outputs a length-normalized vector.
+        # IMPORTANT: each use of goal_rep creates SEPARATE instances (no shared parameters).
         if config['encoder'] is not None:
-            # Pixel-based environments require visual encoders for state inputs, in addition to the pre-defined shared
-            # encoder for subgoal representations.
+            obs_shape = ex_observations.shape[1:]
+            encoder_factory = encoder_modules[config['encoder']]
+
+            # goal_rep: encoder + MLP + LengthNormalize — standalone instance.
+            enc_standalone = encoder_factory(obs_shape, rngs)
+            enc_out_dim = enc_standalone(ex_observations[:1]).shape[-1]
+            goal_rep_def = Sequential([
+                enc_standalone,
+                MLP(enc_out_dim, (*config['value_hidden_dims'], config['rep_dim']),
+                    activate_final=False, layer_norm=config['layer_norm'], rngs=rngs),
+                LengthNormalize(rngs=rngs),
+            ])
+
+            # Separate encoder instances for value, target_value, low_actor encoders.
+            enc_value = encoder_factory(obs_shape, rngs)
+            enc_target_value = encoder_factory(obs_shape, rngs)
+            enc_low_actor = encoder_factory(obs_shape, rngs)
+            enc_high_actor = encoder_factory(obs_shape, rngs)
+
+            # goal_rep instances for value, target_value, low_actor (each with separate params).
+            enc_goal_rep_value = encoder_factory(obs_shape, rngs)
+            goal_rep_value = Sequential([
+                enc_goal_rep_value,
+                MLP(enc_out_dim, (*config['value_hidden_dims'], config['rep_dim']),
+                    activate_final=False, layer_norm=config['layer_norm'], rngs=rngs),
+                LengthNormalize(rngs=rngs),
+            ])
+            enc_goal_rep_target_value = encoder_factory(obs_shape, rngs)
+            goal_rep_target_value = Sequential([
+                enc_goal_rep_target_value,
+                MLP(enc_out_dim, (*config['value_hidden_dims'], config['rep_dim']),
+                    activate_final=False, layer_norm=config['layer_norm'], rngs=rngs),
+                LengthNormalize(rngs=rngs),
+            ])
+            enc_goal_rep_low_actor = encoder_factory(obs_shape, rngs)
+            goal_rep_low_actor = Sequential([
+                enc_goal_rep_low_actor,
+                MLP(enc_out_dim, (*config['value_hidden_dims'], config['rep_dim']),
+                    activate_final=False, layer_norm=config['layer_norm'], rngs=rngs),
+                LengthNormalize(rngs=rngs),
+            ])
 
             # Value: V(encoder^V(s), phi([s; g]))
-            value_encoder_def = GCEncoder(state_encoder=encoder_module(), concat_encoder=goal_rep_def)
-            target_value_encoder_def = GCEncoder(state_encoder=encoder_module(), concat_encoder=goal_rep_def)
+            value_encoder_def = GCEncoder(state_encoder=enc_value, concat_encoder=goal_rep_value)
+            target_value_encoder_def = GCEncoder(state_encoder=enc_target_value, concat_encoder=goal_rep_target_value)
             # Low-level actor: pi^l(. | encoder^l(s), phi([s; w]))
-            low_actor_encoder_def = GCEncoder(state_encoder=encoder_module(), concat_encoder=goal_rep_def)
+            low_actor_encoder_def = GCEncoder(state_encoder=enc_low_actor, concat_encoder=goal_rep_low_actor)
             # High-level actor: pi^h(. | encoder^h([s; g]))
-            high_actor_encoder_def = GCEncoder(concat_encoder=encoder_module())
+            high_actor_encoder_def = GCEncoder(concat_encoder=enc_high_actor)
         else:
             # State-based environments only use the pre-defined shared encoder for subgoal representations.
+            # goal_rep: MLP + LengthNormalize — standalone instance.
+            goal_rep_def = Sequential([
+                MLP(goal_rep_in_dim, (*config['value_hidden_dims'], config['rep_dim']),
+                    activate_final=False, layer_norm=config['layer_norm'], rngs=rngs),
+                LengthNormalize(rngs=rngs),
+            ])
+
+            # Separate goal_rep instances for value, target_value, low_actor.
+            goal_rep_value = Sequential([
+                MLP(goal_rep_in_dim, (*config['value_hidden_dims'], config['rep_dim']),
+                    activate_final=False, layer_norm=config['layer_norm'], rngs=rngs),
+                LengthNormalize(rngs=rngs),
+            ])
+            goal_rep_target_value = Sequential([
+                MLP(goal_rep_in_dim, (*config['value_hidden_dims'], config['rep_dim']),
+                    activate_final=False, layer_norm=config['layer_norm'], rngs=rngs),
+                LengthNormalize(rngs=rngs),
+            ])
+            goal_rep_low_actor = Sequential([
+                MLP(goal_rep_in_dim, (*config['value_hidden_dims'], config['rep_dim']),
+                    activate_final=False, layer_norm=config['layer_norm'], rngs=rngs),
+                LengthNormalize(rngs=rngs),
+            ])
 
             # Value: V(s, phi([s; g]))
-            value_encoder_def = GCEncoder(state_encoder=Identity(), concat_encoder=goal_rep_def)
-            target_value_encoder_def = GCEncoder(state_encoder=Identity(), concat_encoder=goal_rep_def)
+            value_encoder_def = GCEncoder(state_encoder=Identity(rngs=rngs), concat_encoder=goal_rep_value)
+            target_value_encoder_def = GCEncoder(state_encoder=Identity(rngs=rngs), concat_encoder=goal_rep_target_value)
             # Low-level actor: pi^l(. | s, phi([s; w]))
-            low_actor_encoder_def = GCEncoder(state_encoder=Identity(), concat_encoder=goal_rep_def)
+            low_actor_encoder_def = GCEncoder(state_encoder=Identity(rngs=rngs), concat_encoder=goal_rep_low_actor)
             # High-level actor: pi^h(. | s, g) (i.e., no encoder)
             high_actor_encoder_def = None
 
+        # Compute value encoder output dimension.
+        dummy_value_enc = value_encoder_def(ex_observations[:1], ex_goals[:1])
+        value_enc_out = dummy_value_enc.shape[-1]
+
+        # Compute low actor encoder output dimension.
+        # For goal_encoded=True: state_encoder(obs) + goal_rep (shape rep_dim).
+        dummy_low_enc = low_actor_encoder_def(ex_observations[:1], ex_goals[:1])
+        low_actor_enc_out = dummy_low_enc.shape[-1]
+
+        # High actor input dim.
+        if high_actor_encoder_def is not None:
+            dummy_high_enc = high_actor_encoder_def(ex_observations[:1], ex_goals[:1])
+            high_actor_in = dummy_high_enc.shape[-1]
+        else:
+            high_actor_in = obs_dim + obs_dim
+
         # Define value and actor networks.
         value_def = GCValue(
+            in_features=value_enc_out,
             hidden_dims=config['value_hidden_dims'],
             layer_norm=config['layer_norm'],
             ensemble=True,
             gc_encoder=value_encoder_def,
+            rngs=rngs,
         )
         target_value_def = GCValue(
+            in_features=value_enc_out,
             hidden_dims=config['value_hidden_dims'],
             layer_norm=config['layer_norm'],
             ensemble=True,
             gc_encoder=target_value_encoder_def,
+            rngs=rngs,
         )
 
         if config['discrete']:
             low_actor_def = GCDiscreteActor(
+                in_features=low_actor_enc_out,
                 hidden_dims=config['actor_hidden_dims'],
                 action_dim=action_dim,
                 gc_encoder=low_actor_encoder_def,
+                rngs=rngs,
             )
         else:
             low_actor_def = GCActor(
+                in_features=low_actor_enc_out,
                 hidden_dims=config['actor_hidden_dims'],
                 action_dim=action_dim,
                 state_dependent_std=False,
                 const_std=config['const_std'],
                 gc_encoder=low_actor_encoder_def,
+                rngs=rngs,
             )
 
         high_actor_def = GCActor(
+            in_features=high_actor_in,
             hidden_dims=config['actor_hidden_dims'],
             action_dim=config['rep_dim'],
             state_dependent_std=False,
             const_std=config['const_std'],
             gc_encoder=high_actor_encoder_def,
+            rngs=rngs,
         )
 
-        network_info = dict(
-            goal_rep=(goal_rep_def, (jnp.concatenate([ex_observations, ex_goals], axis=-1))),
-            value=(value_def, (ex_observations, ex_goals)),
-            target_value=(target_value_def, (ex_observations, ex_goals)),
-            low_actor=(low_actor_def, (ex_observations, ex_goals)),
-            high_actor=(high_actor_def, (ex_observations, ex_goals)),
-        )
-        networks = {k: v[0] for k, v in network_info.items()}
-        network_args = {k: v[1] for k, v in network_info.items()}
-
-        network_def = ModuleDict(networks)
+        network_def = ModuleDict({
+            'goal_rep': goal_rep_def,
+            'value': value_def,
+            'target_value': target_value_def,
+            'low_actor': low_actor_def,
+            'high_actor': high_actor_def,
+        })
         network_tx = optax.adam(learning_rate=config['lr'])
-        network_params = network_def.init(init_rng, **network_args)['params']
-        network = TrainState.create(network_def, network_params, tx=network_tx)
+        network = TrainState.create(network_def, tx=network_tx)
 
-        params = network.params
-        params['modules_target_value'] = params['modules_value']
+        # Initialize target value with same params as value.
+        network.params['modules_target_value'] = network.params['modules_value']
 
         return cls(rng=rng, network=network, config=dict(config))
 

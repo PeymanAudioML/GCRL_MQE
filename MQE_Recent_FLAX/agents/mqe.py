@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import ml_collections
 import optax
-
+from flax import nnx
 from utils.encoders import GCEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState
 from utils.networks import (
@@ -37,6 +37,7 @@ class MQEAgent:
 
     @jax.jit
     def mrn_distance(self, x: jnp.ndarray, y: jnp.ndarray):
+        """Compute the MRN distance between two sets of representations."""
         K = self.config['components']
         assert x.shape[-1] % K == 0
 
@@ -57,16 +58,21 @@ class MQEAgent:
 
     @jax.jit
     def distance(self, x, y) -> jnp.ndarray:
+        """Compute the distance between two sets of representations."""
         return self.mrn_distance(x, y)
-
 
     @jax.jit
     def critic_loss(self, batch, grad_params, critic_rng):
+        """Compute the MQE critic loss."""
         batch_size = self.config['batch_size']
         key = jax.random.PRNGKey(critic_rng[1])
         use_next_state = jax.random.bernoulli(key, p=self.config['next_state_sample'], shape=(batch_size,))
-        use_next_state_mask = jnp.reshape(use_next_state, (batch_size, *[1] * (len(batch['observations'].shape) - 1)))
-        intermediate_value_goals = jnp.where(use_next_state_mask, batch['next_observations'], batch['intermediate_value_goals'])
+        use_next_state_mask = jnp.reshape(
+            use_next_state, (batch_size, *[1] * (len(batch['observations'].shape) - 1))
+        )
+        intermediate_value_goals = jnp.where(
+            use_next_state_mask, batch['next_observations'], batch['intermediate_value_goals']
+        )
 
         batch_size = batch['observations'].shape[0]
         phi = self.network.select('phi')(batch['observations'], batch['actions'], params=grad_params)
@@ -74,21 +80,18 @@ class MQEAgent:
         psi_next = self.network.select('psi')(intermediate_value_goals, params=grad_params)
         psi_g = self.network.select('psi')(batch['value_goals'], params=grad_params)
 
+        # StateRepresentation with ensemble=True returns (2, B, d).
         if len(psi_s.shape) == 2:  # Non-ensemble
             phi = phi[None, ...]
             psi_s = psi_s[None, ...]
             psi_next = psi_next[None, ...]
             psi_g = psi_g[None, ...]
 
-        # phi = self.get_phi(phi_, psi_s)
-
-        # # logits.shape is (e, B, B) with one term for positive pair and (B - 1) terms for negative pairs in each row.
         dist = self.distance(phi[:, :, None], psi_g[:, None, :])
         dist_next = self.distance(psi_next[:, :, None], psi_g[:, None, :])
 
         I = jnp.eye(batch_size)
         logits = -dist
-
 
         action_dist = self.distance(psi_s, phi)
         action_invariance_loss = jnp.mean(jnp.square(jnp.exp(-action_dist) - 1))
@@ -99,7 +102,11 @@ class MQEAgent:
             delta = dist - dist_next
             mask = delta > t
             delta_clipped = jnp.where(mask, t, delta)
-            one_step_mask = jnp.where(use_next_state_mask.reshape(use_next_state_mask.shape[0],), 1.0, batch['intermediate_value_goals_offsets'])[None,:,None]
+            one_step_mask = jnp.where(
+                use_next_state_mask.reshape(use_next_state_mask.shape[0],),
+                1.0,
+                batch['intermediate_value_goals_offsets'],
+            )[None, :, None]
 
             s = gamma ** one_step_mask
             divergence = jnp.where(mask, delta, s * jnp.exp(delta_clipped) - dist)
@@ -110,7 +117,9 @@ class MQEAgent:
             divergence = divergence * (1 - dw) + diag
             optim_backup = jnp.mean(optim_value)
             return jnp.mean(divergence), optim_backup
-        backup_loss, optim_backup = compute_backup(dist, jax.lax.stop_gradient(dist_next)) # optim_backup=0 -> recovers behavior distance
+
+        # optim_backup=0 -> recovers behavior distance
+        backup_loss, optim_backup = compute_backup(dist, jax.lax.stop_gradient(dist_next))
         optim_backup = jnp.mean(optim_backup)
 
         critic_loss = backup_loss + action_invariance_loss
@@ -141,6 +150,7 @@ class MQEAgent:
 
     @jax.jit
     def actor_loss(self, batch, grad_params, rng=None):
+        """Compute the DDPG+BC actor loss."""
         # Maximize log Q if actor_log_q is True (which is default).
         dist = self.network.select('actor')(batch['observations'], batch['actor_goals'], params=grad_params)
         if self.config['const_std']:
@@ -149,6 +159,7 @@ class MQEAgent:
             q_actions = jnp.clip(dist.sample(seed=rng), -1, 1)
         phi = self.network.select('phi')(batch['observations'], q_actions)
         psi_g = self.network.select('psi')(batch['actor_goals'])
+        # phi and psi_g are (2, B, d) when ensemble=True.
         q1, q2 = -self.distance(phi, psi_g)
         q = jnp.minimum(q1, q2)
 
@@ -175,6 +186,7 @@ class MQEAgent:
 
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None):
+        """Compute the total loss."""
         info = {}
         rng = rng if rng is not None else self.rng
         rng, critic_rng = jax.random.split(rng)
@@ -195,6 +207,7 @@ class MQEAgent:
 
     @jax.jit
     def update(self, batch):
+        """Update the agent and return a new agent with information dictionary."""
         new_rng, rng = jax.random.split(self.rng)
 
         def loss_fn(grad_params):
@@ -212,6 +225,7 @@ class MQEAgent:
         seed=None,
         temperature=1.0,
     ):
+        """Sample actions from the actor."""
         dist = self.network.select('actor')(observations, goals, temperature=temperature)
         actions = dist.sample(seed=seed)
         if not self.config['discrete']:
@@ -220,7 +234,9 @@ class MQEAgent:
 
     @jax.jit
     def get_distance(self, observations, goals, actions):
-        # whether want to compute the action-conditioned distance d(phi(s,a), psi(g)) aka Q(s, a, g) or action-free distance d(phi(s), psi(g)) aka V(s, g)
+        """Compute distance Q(s,a,g) or V(s,g) depending on config."""
+        # whether want to compute the action-conditioned distance d(phi(s,a), psi(g)) aka Q(s, a, g)
+        # or action-free distance d(phi(s), psi(g)) aka V(s, g)
         if self.config['use_action_for_distance']:
             phi = self.network.select('phi')(observations, actions)
         else:
@@ -236,8 +252,10 @@ class MQEAgent:
         ex_actions,
         config,
     ):
+        """Create a new agent."""
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
+        rngs = nnx.Rngs(init_rng)
 
         ex_goals = ex_observations
         if config['discrete']:
@@ -245,75 +263,104 @@ class MQEAgent:
         else:
             action_dim = ex_actions.shape[-1]
 
+        obs_dim = ex_observations.shape[-1]
+        latent_dim = config['latent_dim']
+
         config['gamma'] = config['discount']
 
         # Define encoders.
         encoders = dict()
         if config['encoder'] is not None:
-            encoder_module = encoder_modules[config['encoder']]
+            obs_shape = ex_observations.shape[1:]
+            encoder_factory = encoder_modules[config['encoder']]
             if not config['use_latent']:
-                encoders['actor'] = GCEncoder(concat_encoder=encoder_module())
-            encoders['state'] = encoder_module()
+                encoders['actor'] = GCEncoder(concat_encoder=encoder_factory(obs_shape, rngs))
+            encoders['state'] = encoder_factory(obs_shape, rngs)
+
+        # Compute phi/psi input dims.
+        if encoders.get('state') is not None:
+            state_enc_out = encoders['state'](ex_observations[:1]).shape[-1]
+            phi_in = state_enc_out + action_dim
+            psi_in = state_enc_out
+        else:
+            phi_in = obs_dim + action_dim
+            psi_in = obs_dim
+
+        # Determine actor input dim.
+        if encoders.get('actor') is not None:
+            actor_in = encoders['actor'](ex_observations[:1], ex_goals[:1]).shape[-1]
+        else:
+            actor_in = obs_dim + obs_dim
+
         if config['discrete']:
             phi_def = DiscreteStateActionRepresentation(
+                in_features=phi_in,
                 hidden_dims=config['value_hidden_dims'],
-                latent_dim=config['latent_dim'],
+                latent_dim=latent_dim,
+                action_dim=action_dim,
                 layer_norm=config['layer_norm'],
                 ensemble=True,
                 value_exp=True,
                 state_encoder=encoders.get('state'),
-                action_dim=action_dim,
+                rngs=rngs,
             )
             psi_def = DiscreteStateActionRepresentation(
+                in_features=psi_in,
                 hidden_dims=config['value_hidden_dims'],
-                latent_dim=config['latent_dim'],
+                latent_dim=latent_dim,
+                action_dim=action_dim,
                 layer_norm=config['layer_norm'],
                 ensemble=True,
                 value_exp=True,
                 state_encoder=encoders.get('state'),
-                action_dim=action_dim,
+                rngs=rngs,
             )
             actor_def = GCDiscreteActor(
+                in_features=actor_in,
                 hidden_dims=config['actor_hidden_dims'],
                 action_dim=action_dim,
                 gc_encoder=encoders.get('actor'),
+                rngs=rngs,
             )
         else:
             phi_def = StateRepresentation(
+                in_features=phi_in,
                 hidden_dims=config['value_hidden_dims'],
-                latent_dim=config['latent_dim'],
+                latent_dim=latent_dim,
                 layer_norm=config['layer_norm'],
                 ensemble=True,
                 value_exp=True,
                 state_encoder=encoders.get('state'),
+                rngs=rngs,
             )
             psi_def = StateRepresentation(
+                in_features=psi_in,
                 hidden_dims=config['value_hidden_dims'],
-                latent_dim=config['latent_dim'],
+                latent_dim=latent_dim,
                 layer_norm=config['layer_norm'],
                 ensemble=True,
                 value_exp=True,
                 state_encoder=encoders.get('state'),
+                rngs=rngs,
             )
             actor_def = GCActor(
+                in_features=actor_in,
                 hidden_dims=config['actor_hidden_dims'],
                 action_dim=action_dim,
                 state_dependent_std=False,
                 const_std=config['const_std'],
                 gc_encoder=encoders.get('actor'),
+                rngs=rngs,
             )
-        network_info = dict(
-            actor=(actor_def, (ex_observations, ex_goals)),
-            phi=(phi_def, (ex_observations, ex_actions)),
-            psi=(psi_def, (ex_goals,)),
-        )
-        networks = {k: v[0] for k, v in network_info.items()}
-        network_args = {k: v[1] for k, v in network_info.items()}
 
-        network_def = ModuleDict(networks)
+        network_def = ModuleDict({
+            'actor': actor_def,
+            'phi': phi_def,
+            'psi': psi_def,
+        })
         network_tx = optax.adam(learning_rate=config['lr'])
-        network_params = network_def.init(init_rng, **network_args)['params']
-        network = TrainState.create(network_def, network_params, tx=network_tx)
+        network = TrainState.create(network_def, tx=network_tx)
+
         return cls(rng=rng, network=network, config=dict(config))
 
 
@@ -323,7 +370,7 @@ def get_config():
             # Agent hyperparameters.
             # Network hyperparameters.
             agent_name='mqe',  # Agent name.
-            lr=3e-4, # Learning rate.
+            lr=3e-4,  # Learning rate.
             components=8,  # Number of components to average in the MRN/IQE distance ensemble.
             batch_size=256,  # Batch size.
             actor_hidden_dims=(512, 512, 512),  # Actor network hidden dimensions.
@@ -335,26 +382,23 @@ def get_config():
             const_std=True,  # Whether to use constant standard deviation for the actor.
             discrete=False,  # Whether the action space is discrete.
             normalize_q_loss=True,  # Whether to normalize Q loss.
-
-
+            use_latent=False,  # Whether to use latent for policy action sampling.
 
             # MQE hyperparameters
             discount=0.995,  # Discount factor for sampling value_goal via geometric dist.
-            lambda_=0.95, # lambda for sampling intermediate_value_goal via geometric dist.
-            next_state_sample=0.2, # probability of using next state as intermediate_value_goal.
+            lambda_=0.95,  # lambda for sampling intermediate_value_goal via geometric dist.
+            next_state_sample=0.2,  # probability of using next state as intermediate_value_goal.
             alpha=0.1,  # Temperature in AWR or BC coefficient in DDPG+BC.
-            t=5.0,  # Clipping threshold for the backup LINEX loss. You can increase this if you want more accurate regression (although this might cause numerical instability).
-            diag_backup=0.5,  # Weighting of backups on diagonal (i.e., for s,g ~ p(s,g)) vs. off-diagonal (i.e., for s,g ~ p(s)p(g)). We recommend this to be 0.2-0.4 for locomotion tasks, 0.5-1 for manipulation tasks.
-
-
+            t=5.0,  # Clipping threshold for the backup LINEX loss.
+            diag_backup=0.5,  # Weighting of backups on diagonal vs. off-diagonal.
 
             # Dataset hyperparameters.
             dataset_class='GCDataset',  # Dataset class name.
             value_p_curgoal=0.0,  # Probability of using the current state as the value goal.
-            value_p_trajgoal=1.0,  # Probability of using a future state in the same trajectory as the value goal. Note that we don't need to sample random states as goals because the off-diagonals for distance calculation can suffice for sampling random goals.
+            value_p_trajgoal=1.0,  # Probability of using a future state in the same trajectory as the value goal.
             value_p_randomgoal=0.0,  # Probability of using a random state as the value goal.
             value_geom_sample=True,  # Whether to use geometric distribution for sampling for future value goals.
-            intermediate_value_geom_sample=True,  # Whether to use geometric sampling for intermediate value goals, otherwise defaults to uniform sampling between current state and value_goals.
+            intermediate_value_geom_sample=True,  # Whether to use geometric sampling for intermediate value goals.
             actor_p_curgoal=0.0,  # Probability of using the current state as the actor goal.
             actor_p_trajgoal=1.0,  # Probability of using a future state in the same trajectory as the actor goal.
             actor_p_randomgoal=0.0,  # Probability of using a random state as the actor goal.
@@ -363,11 +407,8 @@ def get_config():
             p_aug=0.0,  # Probability of applying image augmentation. Unused for state-based methods.
             frame_stack=ml_collections.config_dict.placeholder(int),  # Number of frames to stack.
 
-
-
             # Toggle plotting
             use_action_for_distance=True,  # Whether to use action for distance computation Q(s, a, g) or V(s, g)
-            use_latent=False,  # Whether to use latent for policy action sampling (visual encoder only).
         )
     )
     return config

@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import ml_collections
 import optax
+from flax import nnx
 from utils.encoders import GCEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState
 from utils.networks import GCActor, GCBilinearValue, GCDiscreteActor, GCDiscreteBilinearCritic
@@ -212,6 +213,7 @@ class CRLAgent:
         """
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
+        rngs = nnx.Rngs(init_rng)
 
         ex_goals = ex_observations
         if config['discrete']:
@@ -219,20 +221,40 @@ class CRLAgent:
         else:
             action_dim = ex_actions.shape[-1]
 
+        obs_dim = ex_observations.shape[-1]
+
         # Define encoders.
         encoders = dict()
         if config['encoder'] is not None:
-            encoder_module = encoder_modules[config['encoder']]
-            encoders['critic_state'] = encoder_module()
-            encoders['critic_goal'] = encoder_module()
-            encoders['actor'] = GCEncoder(concat_encoder=encoder_module())
+            obs_shape = ex_observations.shape[1:]
+            encoder_factory = encoder_modules[config['encoder']]
+            encoders['critic_state'] = encoder_factory(obs_shape, rngs)
+            encoders['critic_goal'] = encoder_factory(obs_shape, rngs)
+            encoders['actor'] = GCEncoder(concat_encoder=encoder_factory(obs_shape, rngs))
             if config['actor_loss'] == 'awr':
-                encoders['value_state'] = encoder_module()
-                encoders['value_goal'] = encoder_module()
+                encoders['value_state'] = encoder_factory(obs_shape, rngs)
+                encoders['value_goal'] = encoder_factory(obs_shape, rngs)
+
+        # Compute phi/psi input dimensions.
+        if encoders.get('critic_state') is not None:
+            state_enc_out = encoders['critic_state'](ex_observations[:1]).shape[-1]
+            goal_enc_out = encoders['critic_goal'](ex_goals[:1]).shape[-1]
+            phi_in = state_enc_out + (action_dim if not config['discrete'] else action_dim)
+            psi_in = goal_enc_out
+        else:
+            phi_in = obs_dim + (action_dim if not config['discrete'] else action_dim)
+            psi_in = obs_dim
+
+        if encoders.get('actor') is not None:
+            actor_in = encoders['actor'](ex_observations[:1], ex_goals[:1]).shape[-1]
+        else:
+            actor_in = obs_dim + obs_dim
 
         # Define value and actor networks.
         if config['discrete']:
             critic_def = GCDiscreteBilinearCritic(
+                in_features=phi_in,
+                goal_in_features=psi_in,
                 hidden_dims=config['value_hidden_dims'],
                 latent_dim=config['latent_dim'],
                 layer_norm=config['layer_norm'],
@@ -241,9 +263,12 @@ class CRLAgent:
                 state_encoder=encoders.get('critic_state'),
                 goal_encoder=encoders.get('critic_goal'),
                 action_dim=action_dim,
+                rngs=rngs,
             )
         else:
             critic_def = GCBilinearValue(
+                in_features=phi_in,
+                goal_in_features=psi_in,
                 hidden_dims=config['value_hidden_dims'],
                 latent_dim=config['latent_dim'],
                 layer_norm=config['layer_norm'],
@@ -251,11 +276,24 @@ class CRLAgent:
                 value_exp=False,
                 state_encoder=encoders.get('critic_state'),
                 goal_encoder=encoders.get('critic_goal'),
+                rngs=rngs,
             )
+
+        modules = {'critic': critic_def}
 
         if config['actor_loss'] == 'awr':
             # AWR requires a separate V network to compute advantages (Q - V).
+            if encoders.get('value_state') is not None:
+                v_state_out = encoders['value_state'](ex_observations[:1]).shape[-1]
+                v_goal_out = encoders['value_goal'](ex_goals[:1]).shape[-1]
+                v_phi_in = v_state_out
+                v_psi_in = v_goal_out
+            else:
+                v_phi_in = obs_dim
+                v_psi_in = obs_dim
             value_def = GCBilinearValue(
+                in_features=v_phi_in,
+                goal_in_features=v_psi_in,
                 hidden_dims=config['value_hidden_dims'],
                 latent_dim=config['latent_dim'],
                 layer_norm=config['layer_norm'],
@@ -263,38 +301,33 @@ class CRLAgent:
                 value_exp=False,
                 state_encoder=encoders.get('value_state'),
                 goal_encoder=encoders.get('value_goal'),
+                rngs=rngs,
             )
+            modules['value'] = value_def
 
         if config['discrete']:
             actor_def = GCDiscreteActor(
+                in_features=actor_in,
                 hidden_dims=config['actor_hidden_dims'],
                 action_dim=action_dim,
                 gc_encoder=encoders.get('actor'),
+                rngs=rngs,
             )
         else:
             actor_def = GCActor(
+                in_features=actor_in,
                 hidden_dims=config['actor_hidden_dims'],
                 action_dim=action_dim,
                 state_dependent_std=False,
                 const_std=config['const_std'],
                 gc_encoder=encoders.get('actor'),
+                rngs=rngs,
             )
+        modules['actor'] = actor_def
 
-        network_info = dict(
-            critic=(critic_def, (ex_observations, ex_goals, ex_actions)),
-            actor=(actor_def, (ex_observations, ex_goals)),
-        )
-        if config['actor_loss'] == 'awr':
-            network_info.update(
-                value=(value_def, (ex_observations, ex_goals)),
-            )
-        networks = {k: v[0] for k, v in network_info.items()}
-        network_args = {k: v[1] for k, v in network_info.items()}
-
-        network_def = ModuleDict(networks)
+        network_def = ModuleDict(modules)
         network_tx = optax.adam(learning_rate=config['lr'])
-        network_params = network_def.init(init_rng, **network_args)['params']
-        network = TrainState.create(network_def, network_params, tx=network_tx)
+        network = TrainState.create(network_def, tx=network_tx)
 
         return cls(rng=rng, network=network, config=dict(config))
 

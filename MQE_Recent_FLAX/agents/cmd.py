@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import ml_collections
 import optax
-
+from flax import nnx
 from utils.encoders import GCEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState
 from utils.networks import (
@@ -35,6 +35,7 @@ class CMDAgent:
 
     @jax.jit
     def mrn_distance(self, x: jnp.ndarray, y: jnp.ndarray):
+        """Compute the MRN distance between two sets of representations."""
         K = self.config['mrn_components']
         assert x.shape[-1] % K == 0
 
@@ -43,9 +44,8 @@ class CMDAgent:
             eps = 1e-8
             d = x.shape[-1]
             mask = jnp.arange(d) < d // 2
-            max_component: jnp.ndarray = jax.nn.relu(jnp.max((x - y) * mask, axis=-1)) # jax.nn.relu(jax.nn.logsumexp((x - y) * mask, axis=-1, b=1/x.shape[-1])) # jax.nn.relu(jax.nn.logsumexp((x - y) * mask, axis=-1, b=1/x.shape[-1]))#jnp.logsumexp(jax.nn.relu(jnp.max((x - y) * mask , axis=-1)))
+            max_component: jnp.ndarray = jax.nn.relu(jnp.max((x - y) * mask, axis=-1))
             l2_component: jnp.ndarray = jnp.linalg.norm((x - y) * (1 - mask) + eps, axis=-1)
-            # assert max_component.shape == l2_component.shape
             return max_component + l2_component
 
         x_split = jnp.stack(jnp.split(x, K, axis=-1), axis=-1)
@@ -55,6 +55,7 @@ class CMDAgent:
         return dists.mean(axis=-1)
 
     def contrastive_loss(self, batch, grad_params):
+        """Compute the contrastive metric distillation loss."""
         batch_size = batch["observations"].shape[0]
 
         phi = self.network.select("critic")(
@@ -67,12 +68,13 @@ class CMDAgent:
             info=True,
             params=grad_params,
         )
+        # StateRepresentation with ensemble=True returns (2, B, d).
         if len(phi.shape) == 2:  # Non-ensemble
             phi = phi[None, ...]
 
         dist = self.mrn_distance(phi[:, :, None], psi[:, None, :])
         logits = -dist / jnp.sqrt(phi.shape[-1])
-        # logits.shape is (e, B, B) with one term for positive pair and (B - 1) terms for negative pairs in each row.
+        # logits.shape is (e, B, B)
 
         I = jnp.eye(batch_size)
         contrastive_loss = jax.vmap(
@@ -97,9 +99,9 @@ class CMDAgent:
 
     @jax.jit
     def get_distance(self, observations, goals, actions):
-        #actions not used, will be used for cmd
+        """Compute the distance between observations and goals."""
+        # actions not used, will be used for cmd
         if self.config['use_action_for_distance']:
-            # psi = self.network.select('psi')(observations)
             phi = self.network.select('critic')(observations, actions)
         else:
             phi = self.network.select('critic')(observations, jnp.zeros_like(actions))
@@ -107,8 +109,8 @@ class CMDAgent:
         return self.mrn_distance(phi, psi)
 
     def actor_loss(self, batch, grad_params, rng=None):
+        """Compute the DDPG+BC actor loss."""
         # Maximize log Q if actor_log_q is True (which is default).
-
         dist = self.network.select("actor")(batch["observations"], batch["actor_goals"], params=grad_params)
         if self.config["const_std"]:
             q_actions = jnp.clip(dist.mode(), -1, 1)
@@ -121,6 +123,7 @@ class CMDAgent:
 
         phi = self.network.select("critic")(batch["observations"], q_actions)
         psi = self.network.select("critic")(batch["actor_goals"], actions_roll)
+        # phi and psi are (2, B, d) when ensemble=True.
         q1, q2 = -self.mrn_distance(phi, psi)
         q = jnp.minimum(q1, q2)
 
@@ -145,6 +148,7 @@ class CMDAgent:
 
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None):
+        """Compute the total loss."""
         info = {}
         rng = rng if rng is not None else self.rng
 
@@ -162,6 +166,7 @@ class CMDAgent:
 
     @jax.jit
     def update(self, batch):
+        """Update the agent and return a new agent with information dictionary."""
         new_rng, rng = jax.random.split(self.rng)
 
         def loss_fn(grad_params):
@@ -179,6 +184,7 @@ class CMDAgent:
         seed=None,
         temperature=1.0,
     ):
+        """Sample actions from the actor."""
         dist = self.network.select("actor")(observations, goals, temperature=temperature)
         actions = dist.sample(seed=seed)
         if not self.config["discrete"]:
@@ -193,8 +199,10 @@ class CMDAgent:
         ex_actions,
         config,
     ):
+        """Create a new agent."""
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
+        rngs = nnx.Rngs(init_rng)
 
         ex_goals = ex_observations
         if config["discrete"]:
@@ -202,56 +210,76 @@ class CMDAgent:
         else:
             action_dim = ex_actions.shape[-1]
 
+        obs_dim = ex_observations.shape[-1]
+        latent_dim = config["latent_dim"]
+
         # Define encoders.
         encoders = dict()
         if config["encoder"] is not None:
-            encoder_module = encoder_modules[config["encoder"]]
-            encoders["actor"] = GCEncoder(concat_encoder=encoder_module())
-            encoders["state"] = encoder_module()
+            obs_shape = ex_observations.shape[1:]
+            encoder_factory = encoder_modules[config["encoder"]]
+            encoders["actor"] = GCEncoder(concat_encoder=encoder_factory(obs_shape, rngs))
+            encoders["state"] = encoder_factory(obs_shape, rngs)
+
+        # Compute critic input dims.
+        if encoders.get("state") is not None:
+            state_enc_out = encoders["state"](ex_observations[:1]).shape[-1]
+            critic_in = state_enc_out + action_dim
+        else:
+            critic_in = obs_dim + action_dim
+
+        # Determine actor input dim.
+        if encoders.get("actor") is not None:
+            actor_in = encoders["actor"](ex_observations[:1], ex_goals[:1]).shape[-1]
+        else:
+            actor_in = obs_dim + obs_dim
 
         if config["discrete"]:
             critic_def = DiscreteStateActionRepresentation(
+                in_features=critic_in,
                 hidden_dims=config["value_hidden_dims"],
-                latent_dim=config["latent_dim"],
+                latent_dim=latent_dim,
+                action_dim=action_dim,
                 layer_norm=config["layer_norm"],
                 ensemble=True,
                 value_exp=True,
                 state_encoder=encoders.get("state"),
-                action_dim=action_dim,
+                rngs=rngs,
             )
             actor_def = GCDiscreteActor(
+                in_features=actor_in,
                 hidden_dims=config["actor_hidden_dims"],
                 action_dim=action_dim,
                 gc_encoder=encoders.get("actor"),
+                rngs=rngs,
             )
         else:
             critic_def = StateRepresentation(
+                in_features=critic_in,
                 hidden_dims=config["value_hidden_dims"],
-                latent_dim=config["latent_dim"],
+                latent_dim=latent_dim,
                 layer_norm=config["layer_norm"],
                 ensemble=True,
                 value_exp=True,
                 state_encoder=encoders.get("state"),
+                rngs=rngs,
             )
             actor_def = GCActor(
+                in_features=actor_in,
                 hidden_dims=config["actor_hidden_dims"],
                 action_dim=action_dim,
                 state_dependent_std=False,
                 const_std=config["const_std"],
                 gc_encoder=encoders.get("actor"),
+                rngs=rngs,
             )
 
-        network_info = dict(
-            actor=(actor_def, (ex_observations, ex_goals)),
-            critic=(critic_def, (ex_observations, ex_actions)),
-        )
-        networks = {k: v[0] for k, v in network_info.items()}
-        network_args = {k: v[1] for k, v in network_info.items()}
-
-        network_def = ModuleDict(networks)
+        network_def = ModuleDict({
+            'actor': actor_def,
+            'critic': critic_def,
+        })
         network_tx = optax.adam(learning_rate=config["lr"])
-        network_params = network_def.init(init_rng, **network_args)["params"]
-        network = TrainState.create(network_def, network_params, tx=network_tx)
+        network = TrainState.create(network_def, tx=network_tx)
 
         return cls(rng=rng, network=network, config=dict(config))
 

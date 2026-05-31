@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import ml_collections
 import optax
+from flax import nnx
 from utils.encoders import GCEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState
 from utils.networks import GCActor, GCDiscreteActor
@@ -107,6 +108,7 @@ class GCBCAgent:
         """
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
+        rngs = nnx.Rngs(init_rng)
 
         ex_goals = ex_observations
         if config['discrete']:
@@ -114,38 +116,49 @@ class GCBCAgent:
         else:
             action_dim = ex_actions.shape[-1]
 
+        obs_dim = ex_observations.shape[-1]
+
         # Define encoder.
         encoders = dict()
         if config['encoder'] is not None:
-            encoder_module = encoder_modules[config['encoder']]
-            encoders['actor'] = GCEncoder(concat_encoder=encoder_module())
+            obs_shape = ex_observations.shape[1:]  # (H, W, C) for pixel obs
+            encoder_factory = encoder_modules[config['encoder']]
+            encoders['actor'] = GCEncoder(
+                concat_encoder=encoder_factory(obs_shape, rngs)
+            )
+
+        # Determine actor input dimension.
+        if encoders.get('actor') is not None:
+            # Encoder output dim is determined by the mlp_hidden_dims[-1] of ImpalaEncoder.
+            # We compute it by running a dummy forward pass.
+            dummy_enc_out = encoders['actor'](ex_observations[:1], ex_goals[:1])
+            actor_in_features = dummy_enc_out.shape[-1]
+        else:
+            actor_in_features = obs_dim + obs_dim  # obs + goal
 
         # Define actor network.
         if config['discrete']:
             actor_def = GCDiscreteActor(
+                in_features=actor_in_features,
                 hidden_dims=config['actor_hidden_dims'],
                 action_dim=action_dim,
                 gc_encoder=encoders.get('actor'),
+                rngs=rngs,
             )
         else:
             actor_def = GCActor(
+                in_features=actor_in_features,
                 hidden_dims=config['actor_hidden_dims'],
                 action_dim=action_dim,
                 state_dependent_std=False,
                 const_std=config['const_std'],
                 gc_encoder=encoders.get('actor'),
+                rngs=rngs,
             )
 
-        network_info = dict(
-            actor=(actor_def, (ex_observations, ex_goals)),
-        )
-        networks = {k: v[0] for k, v in network_info.items()}
-        network_args = {k: v[1] for k, v in network_info.items()}
-
-        network_def = ModuleDict(networks)
+        network_def = ModuleDict({'actor': actor_def})
         network_tx = optax.adam(learning_rate=config['lr'])
-        network_params = network_def.init(init_rng, **network_args)['params']
-        network = TrainState.create(network_def, network_params, tx=network_tx)
+        network = TrainState.create(network_def, tx=network_tx)
 
         return cls(rng=rng, network=network, config=dict(config))
 

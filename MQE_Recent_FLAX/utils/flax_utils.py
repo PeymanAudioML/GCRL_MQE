@@ -2,74 +2,81 @@ import dataclasses
 import functools
 import glob
 import os
-from typing import Any, Dict, Mapping, Sequence
+from typing import Any, Dict
 
-import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import optax
 import orbax.checkpoint as ocp
+from flax import nnx
 
 
-class ModuleDict(nn.Module):
-    """A dictionary of modules.
+class ModuleDict:
+    """A plain-Python dictionary of NNX modules.
 
-    This allows sharing parameters between modules and provides a convenient way to access them.
+    This is a thin wrapper that holds a dict of modules and provides a
+    convenient interface for TrainState. It is not itself an nnx.Module.
 
     Attributes:
         modules: Dictionary of modules.
     """
 
-    modules: Dict[str, nn.Module]
+    def __init__(self, modules: Dict[str, Any]) -> None:
+        self._modules = modules
 
-    @nn.compact
-    def __call__(self, *args, name=None, **kwargs):
-        """Forward pass.
+    def items(self):
+        return self._modules.items()
 
-        For initialization, call with `name=None` and provide the arguments for each module in `kwargs`.
-        Otherwise, call with `name=<module_name>` and provide the arguments for that module.
-        """
-        if name is None:
-            if kwargs.keys() != self.modules.keys():
-                raise ValueError(
-                    f'When `name` is not specified, kwargs must contain the arguments for each module. '
-                    f'Got kwargs keys {kwargs.keys()} but module keys {self.modules.keys()}'
-                )
-            out = {}
-            for key, value in kwargs.items():
-                if isinstance(value, Mapping):
-                    out[key] = self.modules[key](**value)
-                elif isinstance(value, Sequence):
-                    out[key] = self.modules[key](*value)
-                else:
-                    out[key] = self.modules[key](value)
-            return out
+    def __getitem__(self, key):
+        return self._modules[key]
 
-        return self.modules[name](*args, **kwargs)
+
+class Sequential(nnx.Module):
+    """Sequential container that applies layers in order.
+
+    Args:
+        layers: List of callables / nnx.Modules to apply in sequence.
+
+    Example::
+
+        import jax.numpy as jnp
+        from flax import nnx
+        seq = Sequential([nnx.Linear(4, 8, rngs=nnx.Rngs(0)), jax.nn.relu])
+        y = seq(jnp.ones((2, 4)))  # shape: (2, 8)
+    """
+
+    def __init__(self, layers: list) -> None:
+        self.layers = nnx.List(layers)
+
+    def __call__(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
 
 
 @functools.partial(
     jax.tree_util.register_dataclass,
     data_fields=['step', 'params', 'opt_state'],
-    meta_fields=['apply_fn', 'model_def', 'tx'],
+    meta_fields=['graphdefs', 'tx'],
 )
 @dataclasses.dataclass(frozen=True)
 class TrainState:
-    """Custom train state for models.
+    """Custom train state for NNX models.
 
     Attributes:
-        step: Counter to keep track of the training steps. It is incremented by 1 after each `apply_gradients` call.
-        apply_fn: Apply function of the model.
-        model_def: Model definition.
-        params: Parameters of the model.
+        step: Counter tracking training steps; incremented after each
+            ``apply_gradients`` call.
+        graphdefs: Static dict mapping ``'modules_<name>'`` to
+            ``nnx.GraphDef`` — not traced by JAX.
+        params: Dynamic dict mapping ``'modules_<name>'`` to
+            ``nnx.State`` — traced by JAX.
         tx: optax optimizer.
         opt_state: Optimizer state.
     """
 
     step: int
-    apply_fn: Any = None
-    model_def: Any = None
-    params: Any = None
+    graphdefs: Any  # dict[str, nnx.GraphDef] — STATIC
+    params: Any     # dict[str, nnx.State]    — DYNAMIC
     tx: Any = None
     opt_state: Any = None
 
@@ -77,58 +84,63 @@ class TrainState:
         return dataclasses.replace(self, **kwargs)
 
     @classmethod
-    def create(cls, model_def, params, tx=None, **kwargs):
-        """Create a new train state."""
-        if tx is not None:
-            opt_state = tx.init(params)
-        else:
-            opt_state = None
+    def create(cls, modules, tx=None, **kwargs) -> 'TrainState':
+        """Create a new TrainState.
 
+        Args:
+            modules: Either a ``ModuleDict`` or a plain ``dict`` mapping
+                string names to ``nnx.Module`` instances.
+            tx: Optional optax optimizer.
+            **kwargs: Additional fields forwarded to the dataclass.
+        """
+        # Accept both ModuleDict and plain dict.
+        if isinstance(modules, ModuleDict):
+            module_items = modules.items()
+        else:
+            module_items = modules.items()
+
+        graphdefs: dict = {}
+        states: dict = {}
+        for name, module in module_items:
+            gd, state = nnx.split(module, nnx.Param)
+            key = f'modules_{name}'
+            graphdefs[key] = gd
+            states[key] = state
+
+        opt_state = tx.init(states) if tx is not None else None
         return cls(
             step=1,
-            apply_fn=model_def.apply,
-            model_def=model_def,
-            params=params,
+            graphdefs=graphdefs,
+            params=states,
             tx=tx,
             opt_state=opt_state,
             **kwargs,
         )
 
-    def __call__(self, *args, params=None, method=None, **kwargs):
-        """Forward pass.
-
-        When `params` is not provided, it uses the stored parameters.
-
-        The typical use case is to set `params` to `None` when you want to *stop* the gradients, and to pass the current
-        traced parameters when you want to flow the gradients. In other words, the default behavior is to stop the
-        gradients, and you need to explicitly provide the parameters to flow the gradients.
+    def __call__(self, *args, name: str | None = None, params=None, **kwargs):
+        """Forward pass through a named module.
 
         Args:
-            *args: Arguments to pass to the model.
-            params: Parameters to use for the forward pass. If `None`, it uses the stored parameters, without flowing
-                the gradients.
-            method: Method to call in the model. If `None`, it uses the default `apply` method.
-            **kwargs: Keyword arguments to pass to the model.
+            *args: Positional arguments forwarded to the module.
+            name: Module name (key without the ``'modules_'`` prefix).
+            params: Optional parameter dict (``dict[str, nnx.State]``) to use
+                instead of the stored parameters. Pass the traced grad_params
+                here to flow gradients.
+            **kwargs: Keyword arguments forwarded to the module.
         """
-        if params is None:
-            params = self.params
-        variables = {'params': params}
-        if method is not None:
-            method_name = getattr(self.model_def, method)
-        else:
-            method_name = None
+        p = params if params is not None else self.params
+        key = f'modules_{name}'
+        model = nnx.merge(self.graphdefs[key], p[key])
+        return model(*args, **kwargs)
 
-        return self.apply_fn(variables, *args, method=method_name, **kwargs)
-
-    def select(self, name):
-        """Helper function to select a module from a `ModuleDict`."""
+    def select(self, name: str):
+        """Return a partial that calls the named module."""
         return functools.partial(self, name=name)
 
-    def apply_gradients(self, grads, **kwargs):
-        """Apply the gradients and return the updated state."""
+    def apply_gradients(self, grads, **kwargs) -> 'TrainState':
+        """Apply gradients and return an updated TrainState."""
         updates, new_opt_state = self.tx.update(grads, self.opt_state, self.params)
         new_params = optax.apply_updates(self.params, updates)
-
         return self.replace(
             step=self.step + 1,
             params=new_params,
@@ -137,9 +149,14 @@ class TrainState:
         )
 
     def apply_loss_fn(self, loss_fn):
-        """Apply the loss function and return the updated state and info.
+        """Compute gradients from ``loss_fn`` and apply them.
 
-        It additionally computes the gradient statistics and adds them to the dictionary.
+        It additionally computes gradient statistics and adds them to the
+        returned info dictionary.
+
+        Args:
+            loss_fn: Callable that takes ``params`` and returns
+                ``(loss, info_dict)``.
         """
         grads, info = jax.grad(loss_fn, has_aux=True)(self.params)
 
@@ -147,9 +164,15 @@ class TrainState:
         grad_min = jax.tree_util.tree_map(jnp.min, grads)
         grad_norm = jax.tree_util.tree_map(jnp.linalg.norm, grads)
 
-        grad_max_flat = jnp.concatenate([jnp.reshape(x, -1) for x in jax.tree_util.tree_leaves(grad_max)], axis=0)
-        grad_min_flat = jnp.concatenate([jnp.reshape(x, -1) for x in jax.tree_util.tree_leaves(grad_min)], axis=0)
-        grad_norm_flat = jnp.concatenate([jnp.reshape(x, -1) for x in jax.tree_util.tree_leaves(grad_norm)], axis=0)
+        grad_max_flat = jnp.concatenate(
+            [jnp.reshape(x, -1) for x in jax.tree_util.tree_leaves(grad_max)], axis=0
+        )
+        grad_min_flat = jnp.concatenate(
+            [jnp.reshape(x, -1) for x in jax.tree_util.tree_leaves(grad_min)], axis=0
+        )
+        grad_norm_flat = jnp.concatenate(
+            [jnp.reshape(x, -1) for x in jax.tree_util.tree_leaves(grad_norm)], axis=0
+        )
 
         final_grad_max = jnp.max(grad_max_flat)
         final_grad_min = jnp.min(grad_min_flat)

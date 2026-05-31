@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import ml_collections
 import optax
+from flax import nnx
 from utils.encoders import GCEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState
 from utils.networks import GCActor, GCDiscreteActor, GCDiscreteCritic, GCValue
@@ -158,7 +159,7 @@ class GCIQLAgent:
         """Update the target network."""
         new_target_params = jax.tree_util.tree_map(
             lambda p, tp: p * self.config['tau'] + tp * (1 - self.config['tau']),
-            network.params[f'modules_{module_name}'],
+            self.network.params[f'modules_{module_name}'],
             self.network.params[f'modules_target_{module_name}'],
         )
         network.params[f'modules_target_{module_name}'] = new_target_params
@@ -209,6 +210,7 @@ class GCIQLAgent:
         """
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
+        rngs = nnx.Rngs(init_rng)
 
         ex_goals = ex_observations
         if config['discrete']:
@@ -216,69 +218,110 @@ class GCIQLAgent:
         else:
             action_dim = ex_actions.shape[-1]
 
+        obs_dim = ex_observations.shape[-1]
+
         # Define encoders.
         encoders = dict()
         if config['encoder'] is not None:
-            encoder_module = encoder_modules[config['encoder']]
-            encoders['value'] = GCEncoder(concat_encoder=encoder_module())
-            encoders['critic'] = GCEncoder(concat_encoder=encoder_module())
-            encoders['actor'] = GCEncoder(concat_encoder=encoder_module())
+            obs_shape = ex_observations.shape[1:]
+            encoder_factory = encoder_modules[config['encoder']]
+            encoders['value'] = GCEncoder(concat_encoder=encoder_factory(obs_shape, rngs))
+            encoders['critic'] = GCEncoder(concat_encoder=encoder_factory(obs_shape, rngs))
+            encoders['actor'] = GCEncoder(concat_encoder=encoder_factory(obs_shape, rngs))
+
+        # Compute input dimensions.
+        if encoders.get('value') is not None:
+            value_in = encoders['value'](ex_observations[:1], ex_goals[:1]).shape[-1]
+        else:
+            value_in = obs_dim + obs_dim  # obs + goal
+
+        if encoders.get('critic') is not None:
+            critic_in = encoders['critic'](ex_observations[:1], ex_goals[:1]).shape[-1] + action_dim
+        else:
+            critic_in = obs_dim + obs_dim + (action_dim if not config['discrete'] else action_dim)
+
+        if encoders.get('actor') is not None:
+            actor_in = encoders['actor'](ex_observations[:1], ex_goals[:1]).shape[-1]
+        else:
+            actor_in = obs_dim + obs_dim
 
         # Define value and actor networks.
         value_def = GCValue(
+            in_features=value_in,
             hidden_dims=config['value_hidden_dims'],
             layer_norm=config['layer_norm'],
             ensemble=False,
             gc_encoder=encoders.get('value'),
+            rngs=rngs,
         )
 
         if config['discrete']:
             critic_def = GCDiscreteCritic(
+                in_features=critic_in,
                 hidden_dims=config['value_hidden_dims'],
                 layer_norm=config['layer_norm'],
                 ensemble=True,
                 gc_encoder=encoders.get('critic'),
                 action_dim=action_dim,
+                rngs=rngs,
             )
-        else:
-            critic_def = GCValue(
+            target_critic_def = GCDiscreteCritic(
+                in_features=critic_in,
                 hidden_dims=config['value_hidden_dims'],
                 layer_norm=config['layer_norm'],
                 ensemble=True,
                 gc_encoder=encoders.get('critic'),
+                action_dim=action_dim,
+                rngs=rngs,
+            )
+        else:
+            critic_def = GCValue(
+                in_features=critic_in,
+                hidden_dims=config['value_hidden_dims'],
+                layer_norm=config['layer_norm'],
+                ensemble=True,
+                gc_encoder=encoders.get('critic'),
+                rngs=rngs,
+            )
+            target_critic_def = GCValue(
+                in_features=critic_in,
+                hidden_dims=config['value_hidden_dims'],
+                layer_norm=config['layer_norm'],
+                ensemble=True,
+                gc_encoder=encoders.get('critic'),
+                rngs=rngs,
             )
 
         if config['discrete']:
             actor_def = GCDiscreteActor(
+                in_features=actor_in,
                 hidden_dims=config['actor_hidden_dims'],
                 action_dim=action_dim,
                 gc_encoder=encoders.get('actor'),
+                rngs=rngs,
             )
         else:
             actor_def = GCActor(
+                in_features=actor_in,
                 hidden_dims=config['actor_hidden_dims'],
                 action_dim=action_dim,
                 state_dependent_std=False,
                 const_std=config['const_std'],
                 gc_encoder=encoders.get('actor'),
+                rngs=rngs,
             )
 
-        network_info = dict(
-            value=(value_def, (ex_observations, ex_goals)),
-            critic=(critic_def, (ex_observations, ex_goals, ex_actions)),
-            target_critic=(copy.deepcopy(critic_def), (ex_observations, ex_goals, ex_actions)),
-            actor=(actor_def, (ex_observations, ex_goals)),
-        )
-        networks = {k: v[0] for k, v in network_info.items()}
-        network_args = {k: v[1] for k, v in network_info.items()}
-
-        network_def = ModuleDict(networks)
+        network_def = ModuleDict({
+            'value': value_def,
+            'critic': critic_def,
+            'target_critic': target_critic_def,
+            'actor': actor_def,
+        })
         network_tx = optax.adam(learning_rate=config['lr'])
-        network_params = network_def.init(init_rng, **network_args)['params']
-        network = TrainState.create(network_def, network_params, tx=network_tx)
+        network = TrainState.create(network_def, tx=network_tx)
 
-        params = network_params
-        params['modules_target_critic'] = params['modules_critic']
+        # Initialize target critic with same params as critic.
+        network.params['modules_target_critic'] = network.params['modules_critic']
 
         return cls(rng=rng, network=network, config=dict(config))
 

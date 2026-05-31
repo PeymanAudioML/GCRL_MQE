@@ -4,6 +4,10 @@ import random
 import time
 from collections import defaultdict
 
+# Must be set before jax is imported; use setdefault so explicit env vars take precedence.
+os.environ.setdefault('JAX_PLATFORMS', 'cpu')
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', '')
+
 import jax
 import numpy as np
 import tqdm
@@ -27,8 +31,8 @@ flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
 flags.DEFINE_string('restore_path', None, 'Restore path.')
 flags.DEFINE_integer('restore_epoch', None, 'Restore epoch.')
 
-flags.DEFINE_integer('train_steps', 1000000, 'Number of training steps.')
-flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
+flags.DEFINE_integer('train_steps', 1000, 'Number of training steps.')
+flags.DEFINE_integer('log_interval', 100, 'Logging interval.')
 flags.DEFINE_integer('eval_interval', 100000, 'Evaluation interval.')
 flags.DEFINE_integer('save_interval', 1000000, 'Saving interval.')
 
@@ -36,7 +40,7 @@ flags.DEFINE_integer('eval_tasks', None, 'Number of tasks to evaluate (None for 
 flags.DEFINE_integer('eval_episodes', 20, 'Number of episodes for each task.')
 flags.DEFINE_float('eval_temperature', 0, 'Actor temperature for evaluation.')
 flags.DEFINE_float('eval_gaussian', None, 'Action Gaussian noise for evaluation.')
-flags.DEFINE_integer('video_episodes', 1, 'Number of video episodes for each task.')
+flags.DEFINE_integer('video_episodes', 0, 'Number of video episodes for each task.')
 flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 flags.DEFINE_integer('eval_on_cpu', 1, 'Whether to evaluate on CPU.')
 
