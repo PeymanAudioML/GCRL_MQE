@@ -4,10 +4,6 @@ import random
 import time
 from collections import defaultdict
 
-# Must be set before jax is imported; use setdefault so explicit env vars take precedence.
-os.environ.setdefault('JAX_PLATFORMS', 'cpu')
-os.environ.setdefault('CUDA_VISIBLE_DEVICES', '')
-
 import jax
 import numpy as np
 import tqdm
@@ -110,7 +106,11 @@ def main(_):
             train_metrics = {f'training/{k}': v for k, v in update_info.items()}
             if val_dataset is not None:
                 val_batch = val_dataset.sample(config['batch_size'])
-                _, val_info = agent.total_loss(val_batch, grad_params=None)
+                if hasattr(agent, 'model'):
+                    # Native flax.nnx agents (e.g. MQE) take the model explicitly.
+                    _, val_info = agent.total_loss(agent.model, val_batch, agent.rng)
+                else:
+                    _, val_info = agent.total_loss(val_batch, grad_params=None)
                 train_metrics.update({f'validation/{k}': v for k, v in val_info.items()})
             train_metrics['time/epoch_time'] = (time.time() - last_time) / FLAGS.log_interval
             train_metrics['time/total_time'] = time.time() - first_time
@@ -121,7 +121,13 @@ def main(_):
         # Evaluate agent.
         if i == 1 or i % FLAGS.eval_interval == 0:
             if FLAGS.eval_on_cpu:
-                eval_agent = jax.device_put(agent, device=jax.devices('cpu')[0])
+                cpu_device = jax.devices('cpu')[0]
+                if hasattr(agent, 'to_device'):
+                    # Native flax.nnx agents (e.g. MQE) are not directly
+                    # jax.device_put-able; use their own CPU-copy helper.
+                    eval_agent = agent.to_device(cpu_device)
+                else:
+                    eval_agent = jax.device_put(agent, device=cpu_device)
             else:
                 eval_agent = agent
             renders = []

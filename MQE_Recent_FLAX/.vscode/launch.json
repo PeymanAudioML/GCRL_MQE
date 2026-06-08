@@ -1,0 +1,80 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "MQE – quick debug",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "python": "/usr/bin/python3.10",
+            "args": [
+                "--agent", "agents/mqe.py",
+                "--env_name", "antmaze-large-navigate-v0",
+                "--train_steps", "10",
+                "--log_interval", "5",
+                "--eval_interval", "100000",
+                "--save_interval", "100000",
+                "--video_episodes", "0",
+                "--run_group", "Debug"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "MUJOCO_GL": "egl",
+                "PYGLFW_LIBRARY": "/lib/x86_64-linux-gnu/libglfw.so.3",
+                "WANDB_MODE": "offline"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "GCIQL – quick debug",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "python": "/usr/bin/python3.10",
+            "args": [
+                "--agent", "agents/gciql.py",
+                "--env_name", "antmaze-large-navigate-v0",
+                "--train_steps", "10",
+                "--log_interval", "5",
+                "--eval_interval", "100000",
+                "--save_interval", "100000",
+                "--video_episodes", "0",
+                "--run_group", "Debug"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "MUJOCO_GL": "egl",
+                "PYGLFW_LIBRARY": "/lib/x86_64-linux-gnu/libglfw.so.3",
+                "WANDB_MODE": "offline"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "TMD – quick debug",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "python": "/usr/bin/python3.10",
+            "args": [
+                "--agent", "agents/tmd.py",
+                "--env_name", "antmaze-large-navigate-v0",
+                "--train_steps", "10",
+                "--log_interval", "5",
+                "--eval_interval", "100000",
+                "--save_interval", "100000",
+                "--video_episodes", "0",
+                "--run_group", "Debug"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "MUJOCO_GL": "egl",
+                "PYGLFW_LIBRARY": "/lib/x86_64-linux-gnu/libglfw.so.3",
+                "WANDB_MODE": "offline"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": false
+        }
+    ]
+}

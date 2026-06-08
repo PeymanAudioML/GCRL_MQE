@@ -1,6 +1,3 @@
-import dataclasses
-import functools
-from functools import partial
 from typing import Any
 
 import jax
@@ -9,39 +6,124 @@ import ml_collections
 import optax
 from flax import nnx
 from utils.encoders import GCEncoder, encoder_modules
-from utils.flax_utils import ModuleDict, TrainState
 from utils.networks import (
     DiscreteStateActionRepresentation,
     GCActor,
     GCDiscreteActor,
-    Param,
     StateRepresentation,
 )
 
 
-@functools.partial(
-    jax.tree_util.register_dataclass,
-    data_fields=['rng', 'network'],
-    meta_fields=['config'],
-)
-@dataclasses.dataclass(frozen=True)
+class MQENetwork(nnx.Module):
+    """Native flax.nnx container holding the MQE sub-networks.
+
+    Stores the three modules the MQE algorithm uses:
+    - ``actor``: the (goal-conditioned) policy network.
+    - ``phi``:   the state-action representation phi(s, a).
+    - ``psi``:   the state/goal representation psi(s) / psi(g).
+
+    ``select`` is kept for parity with the previous ModuleDict interface, so
+    losses can be written as either ``model.phi(...)`` or
+    ``model.select('phi')(...)``.
+    """
+
+    def __init__(self, actor, phi, psi) -> None:
+        self.actor = actor
+        self.phi = phi
+        self.psi = psi
+
+    def select(self, name: str):
+        return getattr(self, name)
+
+
+@nnx.jit
+def _mqe_sample_actions(model, observations, goals, seed, temperature):
+    """JIT-compiled action sampling from the MQE actor."""
+    dist = model.actor(observations, goals, temperature=temperature)
+    return dist.sample(seed=seed)
+
+
+def _build_update_step(agent):
+    """Build the per-agent, nnx-native jitted training step.
+
+    The returned function takes the live ``model`` and ``optimizer`` graph
+    nodes (plus ``rng`` and ``batch``) and mutates them in place across the
+    ``nnx.jit`` boundary, exactly like the standard flax.nnx train-step
+    pattern. ``agent`` is captured only for its (static) ``config`` and its
+    loss methods; the jitted region never reads ``agent.model`` /
+    ``agent.optimizer`` (it uses the passed-in args), so there is no aliasing.
+    """
+
+    @nnx.jit
+    def _update_step(model, optimizer, rng, batch):
+        def loss_fn(m):
+            return agent.total_loss(m, batch, rng)
+
+        (loss, info), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
+
+        # Gradient statistics, preserved from the old apply_loss_fn().
+        grad_max = jax.tree_util.tree_map(jnp.max, grads)
+        grad_min = jax.tree_util.tree_map(jnp.min, grads)
+        grad_norm = jax.tree_util.tree_map(jnp.linalg.norm, grads)
+        grad_max_flat = jnp.concatenate(
+            [jnp.reshape(x, -1) for x in jax.tree_util.tree_leaves(grad_max)], axis=0
+        )
+        grad_min_flat = jnp.concatenate(
+            [jnp.reshape(x, -1) for x in jax.tree_util.tree_leaves(grad_min)], axis=0
+        )
+        grad_norm_flat = jnp.concatenate(
+            [jnp.reshape(x, -1) for x in jax.tree_util.tree_leaves(grad_norm)], axis=0
+        )
+
+        info = dict(info)
+        info['grad/max'] = jnp.max(grad_max_flat)
+        info['grad/min'] = jnp.min(grad_min_flat)
+        info['grad/norm'] = jnp.linalg.norm(grad_norm_flat, ord=1)
+
+        # In-place parameter update (mutates `model`, which the optimizer holds).
+        optimizer.update(grads)
+        return info
+
+    return _update_step
+
+
 class MQEAgent:
-    """Multistep Quasimetric Estimation (MQE) agent."""
+    """Multistep Quasimetric Estimation (MQE) agent.
 
-    rng: Any
-    network: Any
-    config: Any = None
+    This MQE implementation uses native flax.nnx modules and nnx.Optimizer
+    instead of the older custom TrainState split/merge wrapper. The agent is a
+    plain (mutable) Python object holding:
 
-    def replace(self, **kwargs) -> 'MQEAgent':
-        return dataclasses.replace(self, **kwargs)
+        MQEAgent
+        ├── rng        (jax PRNGKey, advanced on every update)
+        ├── model      (MQENetwork: actor / phi / psi)
+        ├── optimizer  (nnx.Optimizer, wrt=nnx.Param)
+        └── config     (plain dict of hyperparameters)
 
-    @jax.jit
+    Training flow (see ``update``):
+
+        batch = train_dataset.sample(batch_size)
+        loss, grads = nnx.value_and_grad(total_loss)(model)
+        optimizer.update(grads)        # mutates model in place
+
+    The MQE algorithm, loss equations, RNG handling, and logged metrics are
+    unchanged from the TrainState-based implementation.
+    """
+
+    def __init__(self, rng, model, optimizer, config) -> None:
+        self.rng = rng
+        self.model = model
+        self.optimizer = optimizer
+        self.config = config
+        # Lazily-built jitted step; set by create(). Eval-only copies
+        # (see to_device) leave this as None since they never update.
+        self._update_step = None
+
     def mrn_distance(self, x: jnp.ndarray, y: jnp.ndarray):
         """Compute the MRN distance between two sets of representations."""
         K = self.config['components']
         assert x.shape[-1] % K == 0
 
-        @jax.jit
         def mrn_distance_component(x: jnp.ndarray, y: jnp.ndarray):
             eps = 1e-8
             d = x.shape[-1]
@@ -56,13 +138,11 @@ class MQEAgent:
 
         return dists.mean(axis=-1) / jnp.sqrt(x.shape[-1])
 
-    @jax.jit
     def distance(self, x, y) -> jnp.ndarray:
         """Compute the distance between two sets of representations."""
         return self.mrn_distance(x, y)
 
-    @jax.jit
-    def critic_loss(self, batch, grad_params, critic_rng):
+    def critic_loss(self, model, batch, critic_rng):
         """Compute the MQE critic loss."""
         batch_size = self.config['batch_size']
         key = jax.random.PRNGKey(critic_rng[1])
@@ -75,10 +155,10 @@ class MQEAgent:
         )
 
         batch_size = batch['observations'].shape[0]
-        phi = self.network.select('phi')(batch['observations'], batch['actions'], params=grad_params)
-        psi_s = self.network.select('psi')(batch['observations'], params=grad_params)
-        psi_next = self.network.select('psi')(intermediate_value_goals, params=grad_params)
-        psi_g = self.network.select('psi')(batch['value_goals'], params=grad_params)
+        phi = model.phi(batch['observations'], batch['actions'])
+        psi_s = model.psi(batch['observations'])
+        psi_next = model.psi(intermediate_value_goals)
+        psi_g = model.psi(batch['value_goals'])
 
         # StateRepresentation with ensemble=True returns (2, B, d).
         if len(psi_s.shape) == 2:  # Non-ensemble
@@ -148,17 +228,16 @@ class MQEAgent:
             },
         )
 
-    @jax.jit
-    def actor_loss(self, batch, grad_params, rng=None):
+    def actor_loss(self, model, batch, rng=None):
         """Compute the DDPG+BC actor loss."""
         # Maximize log Q if actor_log_q is True (which is default).
-        dist = self.network.select('actor')(batch['observations'], batch['actor_goals'], params=grad_params)
+        dist = model.actor(batch['observations'], batch['actor_goals'])
         if self.config['const_std']:
             q_actions = jnp.clip(dist.mode(), -1, 1)
         else:
             q_actions = jnp.clip(dist.sample(seed=rng), -1, 1)
-        phi = self.network.select('phi')(batch['observations'], q_actions)
-        psi_g = self.network.select('psi')(batch['actor_goals'])
+        phi = model.phi(batch['observations'], q_actions)
+        psi_g = model.psi(batch['actor_goals'])
         # phi and psi_g are (2, B, d) when ensemble=True.
         q1, q2 = -self.distance(phi, psi_g)
         q = jnp.minimum(q1, q2)
@@ -184,40 +263,38 @@ class MQEAgent:
             'std': jnp.mean(dist.scale_diag),
         }
 
-    @jax.jit
-    def total_loss(self, batch, grad_params, rng=None):
+    def total_loss(self, model, batch, rng=None):
         """Compute the total loss."""
         info = {}
         rng = rng if rng is not None else self.rng
         rng, critic_rng = jax.random.split(rng)
 
-        critic_loss, critic_info = self.critic_loss(
-            batch, grad_params, critic_rng
-        )
+        critic_loss, critic_info = self.critic_loss(model, batch, critic_rng)
         for k, v in critic_info.items():
             info[f'critic/{k}'] = v
 
         rng, actor_rng = jax.random.split(rng)
-        actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_rng)
+        actor_loss, actor_info = self.actor_loss(model, batch, actor_rng)
         for k, v in actor_info.items():
             info[f'actor/{k}'] = v
 
         total_loss = critic_loss + actor_loss
         return total_loss, info
 
-    @jax.jit
     def update(self, batch):
-        """Update the agent and return a new agent with information dictionary."""
+        """Update the agent in place and return ``(self, info)``.
+
+        Uses the nnx-native pattern: gradients are taken w.r.t. the model's
+        nnx.Param state and applied via ``nnx.Optimizer.update`` inside an
+        ``nnx.jit`` step that mutates ``self.model`` and ``self.optimizer`` in
+        place. ``self`` is returned for compatibility with the previous
+        ``agent, info = agent.update(batch)`` call site.
+        """
         new_rng, rng = jax.random.split(self.rng)
+        info = self._update_step(self.model, self.optimizer, rng, batch)
+        self.rng = new_rng
+        return self, info
 
-        def loss_fn(grad_params):
-            return self.total_loss(batch, grad_params, rng=rng)
-
-        new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
-
-        return self.replace(network=new_network, rng=new_rng), info
-
-    @jax.jit
     def sample_actions(
         self,
         observations,
@@ -226,23 +303,41 @@ class MQEAgent:
         temperature=1.0,
     ):
         """Sample actions from the actor."""
-        dist = self.network.select('actor')(observations, goals, temperature=temperature)
-        actions = dist.sample(seed=seed)
+        actions = _mqe_sample_actions(
+            self.model, observations, goals, seed, jnp.asarray(temperature, dtype=jnp.float32)
+        )
         if not self.config['discrete']:
             actions = jnp.clip(actions, -1, 1)
         return actions
 
-    @jax.jit
     def get_distance(self, observations, goals, actions):
         """Compute distance Q(s,a,g) or V(s,g) depending on config."""
         # whether want to compute the action-conditioned distance d(phi(s,a), psi(g)) aka Q(s, a, g)
         # or action-free distance d(phi(s), psi(g)) aka V(s, g)
         if self.config['use_action_for_distance']:
-            phi = self.network.select('phi')(observations, actions)
+            phi = self.model.phi(observations, actions)
         else:
-            phi = self.network.select('psi')(observations)
-        psi = self.network.select('psi')(goals)
+            phi = self.model.psi(observations)
+        psi = self.model.psi(goals)
         return self.distance(phi, psi)
+
+    def to_device(self, device):
+        """Return an eval-only copy of the agent with its model on ``device``.
+
+        Replaces the old ``jax.device_put(agent, ...)`` path (NNX modules are
+        not directly device_put-able). The returned agent shares ``config`` and
+        carries only what evaluation needs (``model`` + ``rng``); it has no
+        optimizer or update step.
+        """
+        graphdef, state = nnx.split(self.model)
+        state = jax.device_put(state, device)
+        model = nnx.merge(graphdef, state)
+        return MQEAgent(
+            rng=jax.device_put(self.rng, device),
+            model=model,
+            optimizer=None,
+            config=self.config,
+        )
 
     @classmethod
     def create(
@@ -252,7 +347,11 @@ class MQEAgent:
         ex_actions,
         config,
     ):
-        """Create a new agent."""
+        """Create a new agent.
+
+        This MQE implementation uses native flax.nnx modules and nnx.Optimizer
+        instead of the older custom TrainState split/merge wrapper.
+        """
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
         rngs = nnx.Rngs(init_rng)
@@ -353,15 +452,14 @@ class MQEAgent:
                 rngs=rngs,
             )
 
-        network_def = ModuleDict({
-            'actor': actor_def,
-            'phi': phi_def,
-            'psi': psi_def,
-        })
-        network_tx = optax.adam(learning_rate=config['lr'])
-        network = TrainState.create(network_def, tx=network_tx)
+        # Native flax.nnx model + optimizer (replaces ModuleDict + TrainState).
+        model = MQENetwork(actor=actor_def, phi=phi_def, psi=psi_def)
+        tx = optax.adam(learning_rate=config['lr'])
+        optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
-        return cls(rng=rng, network=network, config=dict(config))
+        agent = cls(rng=rng, model=model, optimizer=optimizer, config=dict(config))
+        agent._update_step = _build_update_step(agent)
+        return agent
 
 
 def get_config():
